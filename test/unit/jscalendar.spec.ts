@@ -104,6 +104,13 @@ describe("iCalendar → JSCalendar", () => {
     expect(r.events[0]).toMatchObject({ uid: "u", timeZone: "Etc/UTC", start: "2025-01-01T12:00:00" });
   });
 
+  it("maps Outlook's Windows TZIDs to IANA zones", () => {
+    const r = parseICalendar("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:w\nDTSTART;TZID=Romance Standard Time:20250601T100000\nDURATION:PT1H\nEND:VEVENT\nEND:VCALENDAR");
+    expect(r.events[0]).toMatchObject({ timeZone: "Europe/Paris", start: "2025-06-01T10:00:00" });
+    const u = parseICalendar("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:w\nDTSTART;TZID=\"(UTC+11:00) Noumea Standard Time\":20250601T100000\nDURATION:PT1H\nEND:VEVENT\nEND:VCALENDAR");
+    expect(u.events[0]!.timeZone).toBeNull();
+  });
+
   it("exposes a lone override as an event with recurrenceId", () => {
     const r = parseICalendar("BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:u\nRECURRENCE-ID:20250105T120000Z\nDTSTART:20250105T130000Z\nDURATION:PT1H\nEND:VEVENT\nEND:VCALENDAR");
     expect(r.events[0]).toMatchObject({ recurrenceId: "2025-01-05T12:00:00", recurrenceIdTimeZone: "Etc/UTC", method: "REQUEST" });

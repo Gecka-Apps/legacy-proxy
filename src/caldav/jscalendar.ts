@@ -23,6 +23,7 @@ import {
   utcToLocal,
   type LocalParts,
 } from "./tz.js";
+import { windowsZoneToIana } from "./windows-zones.js";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -105,11 +106,18 @@ function zoneOf(prop: ICAL.Property, value: ICAL.Time, vtimezones: Map<string, s
   return null;
 }
 
-/** Map a TZID to an IANA zone: itself when valid, else the VTIMEZONE's X-LIC-LOCATION, else null. */
+/**
+ * Map a TZID to an IANA zone: itself when valid, else the VTIMEZONE's
+ * X-LIC-LOCATION, else a Windows display name ("Romance Standard Time",
+ * what Outlook / Exchange put in invitations), else an Olson path embedded
+ * in a vendor id. Null means floating.
+ */
 function resolveTzid(tzid: string, vtimezones: Map<string, string>): string | null {
   if (isValidTimeZone(tzid)) return tzid;
   const loc = vtimezones.get(tzid);
   if (loc && isValidTimeZone(loc)) return loc;
+  const win = windowsZoneToIana(tzid);
+  if (win && isValidTimeZone(win)) return win;
   // Outlook-style "/freeassociation.sourceforge.net/Europe/Paris" ids.
   const tail = /\/([A-Za-z_]+\/[A-Za-z_+-]+(?:\/[A-Za-z_+-]+)?)$/.exec(tzid)?.[1];
   if (tail && isValidTimeZone(tail)) return tail;
