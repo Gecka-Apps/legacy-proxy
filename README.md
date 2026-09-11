@@ -140,6 +140,13 @@ Backends:
   (`isVisible`, `sortOrder`, default alerts, …) live in the proxy's SQLite
   database. An account with no calendar gets a `Calendar` collection created
   on the first `CalendarEvent/set`.
+- iMIP (RFC 6047) over the SMTP submission backend when a client sets
+  `sendSchedulingMessages: true` on `CalendarEvent/set`: as organizer,
+  `REQUEST` to the attendees on create / update and `CANCEL` to dropped
+  attendees and on destroy; as attendee, `REPLY` to the organizer when the
+  user's own `participationStatus` changes. Participants with
+  `scheduleAgent: "client"` / `"none"` are skipped. A mail failure is logged
+  and never fails the calendar write.
 
 Auth and storage:
 
@@ -166,10 +173,9 @@ Sort and filter:
 
 ## Not implemented
 
-- Scheduling: `sendSchedulingMessages` on `CalendarEvent/set` is accepted but
-  no iMIP message is sent, and the CalDAV server is not asked to schedule
-  either. Invitations received by mail can be parsed (`CalendarEvent/parse`)
-  and saved as events. `Principal/*` and free/busy are not exposed.
+- Scheduling beyond iMIP: `Principal/*`, free/busy and the scheduling inbox
+  are not exposed. Incoming iMIP mail is not applied to the calendar
+  automatically; the client parses it (`CalendarEvent/parse`) and saves it.
 - `CalendarEvent/query` `expandRecurrences`. The client is expected to expand
   recurring events itself; the probe Bulwark uses to detect server-side
   expansion is answered with `invalidProperties` so it keeps doing so.
@@ -383,7 +389,7 @@ src/
                    vacation script generator
   carddav/         CardDAV client + vCard / JSContact translation
   caldav/          CalDAV client, iCalendar / JSCalendar translation, Intl-based
-                   time-zone arithmetic + VTIMEZONE synthesis
+                   time-zone arithmetic + VTIMEZONE synthesis, iMIP planner
   push/            PushDispatcher (SSE + relay fan-out), PushIdleManager
   auth/            session tokens, AES-256-GCM credential vault, providers
   mapping/         IMAP <-> JMAP id/blobId codecs, flag map, body structure,

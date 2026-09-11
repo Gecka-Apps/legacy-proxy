@@ -30,6 +30,7 @@ import type { ImapPool } from "../../imap/pool.js";
 import { accountNotFound, JmapError } from "../errors.js";
 import { applyPatch } from "./contacts.js";
 import { readBlob } from "../blobs.js";
+import { planScheduling, sendScheduling, type ImipMessage } from "../../caldav/imip.js";
 import { log } from "../../util/log.js";
 
 export interface CalendarCtx {
@@ -650,6 +651,14 @@ export async function calendarEventSet(
   const oldState = combinedState(cals);
   if (args.ifInState != null && args.ifInState !== oldState) throw new JmapError("stateMismatch");
   const out = emptySet<JsonObject>(args.accountId, oldState);
+  // iMIP messages owed for the writes that succeeded; sent once the CalDAV
+  // side is done so a mail failure can never fail the write itself.
+  const scheduling: ImipMessage[] = [];
+  const me = accountEmail(ctx.account);
+  const schedule = (before: JsonObject | null, after: JsonObject | null) => {
+    if (args.sendSchedulingMessages !== true) return;
+    scheduling.push(...planScheduling({ me, meName: ctx.store.getIdentitySettings(ctx.account.id).displayName, before, after }));
+  };
 
   for (const [tempId, raw] of Object.entries(args.create ?? {})) {
     try {
@@ -675,6 +684,7 @@ export async function calendarEventSet(
       const id = eventId(picked.cal.href, resourceHref);
       const { utcStart, utcEnd } = utcBounds(input, null);
       (out.created ??= {})[tempId] = { id, uid, baseEventId: id, isDraft: false, isOrigin: true, utcStart, utcEnd };
+      schedule(null, input);
     } catch (e) {
       log.warn({ err: (e as Error).message, tempId }, "CalendarEvent/set create failed");
       (out.notCreated ??= {})[tempId] = errorFor(e, "invalidProperties");
@@ -730,6 +740,7 @@ export async function calendarEventSet(
       const ics = serializeEvent(draft, { preserveFrom: current.raw });
       await client.putResource(parts.resourceHref, ics, { ifMatch: existing.etag });
       (out.updated ??= {})[id] = null;
+      schedule(current.event, draft);
     } catch (e) {
       log.warn({ err: (e as Error).message, id }, "CalendarEvent/set update failed");
       (out.notUpdated ??= {})[id] = errorFor(e, "invalidProperties");
@@ -744,8 +755,14 @@ export async function calendarEventSet(
         (out.notDestroyed ??= {})[id] = setError("notFound");
         continue;
       }
+      let before: LoadedEvent | null = null;
+      if (args.sendSchedulingMessages === true) {
+        const [existing] = await client.multiGet(cal.href, [parts.resourceHref]);
+        before = existing ? loadResource(cal.href, existing) : null;
+      }
       await client.deleteResource(parts.resourceHref);
       (out.destroyed ??= []).push(id);
+      if (before) schedule(before.event, null);
     } catch (e) {
       log.warn({ err: (e as Error).message, id }, "CalendarEvent/set destroy failed");
       (out.notDestroyed ??= {})[id] = errorFor(e);
@@ -757,7 +774,20 @@ export async function calendarEventSet(
     out.newState = combinedState(cals);
     ctx.store.bumpState(ctx.account.id, "calendarevent");
   }
+  if (scheduling.length) {
+    await sendScheduling(
+      { provider: ctx.provider, creds: ctx.creds, from: me, fromName: ctx.store.getIdentitySettings(ctx.account.id).displayName },
+      scheduling,
+    );
+  }
   return out;
+}
+
+/** The account's address: the login when it is one, else user@host as Identity/get does. */
+function accountEmail(account: AccountRow): string {
+  if (account.username.includes("@")) return account.username.toLowerCase();
+  const domain = (account.host || "localhost").replace(/^(imap|imaps|mail|smtp|submission|pop|pop3)\./i, "");
+  return `${account.username}@${domain}`.toLowerCase();
 }
 
 function hasExplicitCalendar(calendarIds: unknown): boolean {
@@ -829,8 +859,7 @@ export async function participantIdentityGet(
 }
 
 function identityOf(account: AccountRow): JsonObject {
-  const email = account.username.includes("@") ? account.username : `${account.username}@${account.host}`;
-  return { id: "primary", name: "", calendarAddress: `mailto:${email}`, isDefault: true };
+  return { id: "primary", name: "", calendarAddress: `mailto:${accountEmail(account)}`, isDefault: true };
 }
 
 export async function participantIdentitySet(

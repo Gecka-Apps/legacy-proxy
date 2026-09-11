@@ -20,6 +20,15 @@ import type { AccountRow, Store } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 
+// SMTP submission is mocked: the iMIP tests only need to see what would go out.
+const sent: Array<{ envelopeFrom: string; rcptTo: string[]; raw: Buffer }> = [];
+vi.mock("../../src/smtp/submit.js", () => ({
+  submit: vi.fn(async (o: { envelopeFrom: string; rcptTo: string[]; raw: Buffer }) => {
+    sent.push(o);
+    return { messageId: "<m>", envelope: { from: o.envelopeFrom, to: o.rcptTo }, accepted: o.rcptTo, rejected: [], response: "250 ok" };
+  }),
+}));
+
 interface Resource {
   data: string;
   etag: string;
@@ -223,6 +232,7 @@ function fakeStore() {
     deletePref: (_a: number, k: string) => prefs.delete(k),
     getUpload: (id: string) => (uploads.has(id) ? { ctype: "text/calendar", body: uploads.get(id)! } : null),
     getCachedBlob: () => null,
+    getIdentitySettings: () => ({ displayName: "Me", replyTo: null, textSignature: null, htmlSignature: null }),
     getState: () => 0,
     bumpState: () => 1,
   } as unknown as Store & { uploads: Map<string, Buffer> };
@@ -252,6 +262,7 @@ let ctx: CalendarCtx;
 
 beforeEach(() => {
   resetCalDavCaches();
+  sent.length = 0;
   dav = new FakeDav();
   store = fakeStore();
   ctx = { account: { id: 7, username: "u@x.io", host: "x.io", kind: "generic" } as AccountRow, provider, creds: { mech: "PLAIN", username: "u", password: "p" }, store };
@@ -382,6 +393,49 @@ describe("CalendarEvent/set", () => {
     expect(r.destroyed).toEqual([id]);
     expect(r.notDestroyed?.bogus).toMatchObject({ type: "notFound" });
     expect(dav.cals.get(href)!.resources.size).toBe(0);
+  });
+});
+
+describe("CalendarEvent/set scheduling", () => {
+  const withBob = {
+    "@type": "Event",
+    title: "Kickoff",
+    start: "2025-06-03T14:00:00",
+    duration: "PT1H",
+    timeZone: "Europe/Paris",
+    replyTo: { imip: "mailto:u@x.io" },
+    participants: {
+      me: { "@type": "Participant", email: "u@x.io", roles: { owner: true, attendee: true }, participationStatus: "accepted" },
+      bob: { "@type": "Participant", email: "bob@x.io", roles: { attendee: true }, participationStatus: "needs-action", expectReply: true },
+    },
+  };
+
+  it("mails a REQUEST on create and a CANCEL on destroy when asked to", async () => {
+    dav.addCalendar("work", "Work");
+    const r = await calendarEventSet({ accountId: "7", create: { n: withBob }, sendSchedulingMessages: true }, ctx);
+    expect(r.notCreated).toBeNull();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ envelopeFrom: "u@x.io", rcptTo: ["bob@x.io"] });
+    const raw = sent[0]!.raw.toString("utf8");
+    expect(raw).toContain("Subject: Invitation: Kickoff");
+    expect(raw).toContain("From: Me <u@x.io>");
+    expect(raw).toContain("method=REQUEST");
+    expect(raw).toContain("METHOD:REQUEST");
+    expect(raw).toContain("ATTENDEE;PARTSTAT=ACCEPTED:mailto:u@x.io");
+    expect(raw).toContain("ATTENDEE;RSVP=TRUE:mailto:bob@x.io");
+
+    sent.length = 0;
+    const d = await calendarEventSet({ accountId: "7", destroy: [r.created!.n.id as string], sendSchedulingMessages: true }, ctx);
+    expect(d.destroyed).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.raw.toString("utf8")).toContain("METHOD:CANCEL");
+    expect(sent[0]!.raw.toString("utf8")).toContain("STATUS:CANCELLED");
+  });
+
+  it("stays silent without sendSchedulingMessages", async () => {
+    dav.addCalendar("work", "Work");
+    await calendarEventSet({ accountId: "7", create: { n: withBob } }, ctx);
+    expect(sent).toHaveLength(0);
   });
 });
 
