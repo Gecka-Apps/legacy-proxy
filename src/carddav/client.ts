@@ -379,12 +379,20 @@ export class CardDavClient {
     }
   }
 
+  /**
+   * Forward an arbitrary DAV request from a client (the webmail's /dav
+   * proxy path) to the server and hand the raw response back.
+   */
+  async proxy(method: string, href: string, body: Buffer | null, headers: Record<string, string>): Promise<Response> {
+    return this.raw(method, href, body, headers);
+  }
+
   // -- low-level ----------------------------------------------------------
 
   private async raw(
     method: string,
     path: string,
-    body: string | null,
+    body: string | Buffer | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
     const url = absolutise(this.origin, path);
@@ -396,7 +404,7 @@ export class CardDavClient {
     const res = await fetch(url, {
       method,
       headers: { Authorization: this.authHeader, ...headers },
-      ...(body === null ? {} : { body }),
+      ...(body === null ? {} : { body: body as BodyInit }),
     });
     log.debug({ method, url, status: res.status }, "carddav request");
     return res;
@@ -476,7 +484,7 @@ async function httpError(method: string, path: string, res: Response): Promise<E
 // XML helpers (deliberately small, namespace-aware on local name only).
 // -----------------------------------------------------------------------
 
-function buildAuth(c: Credentials): string {
+export function buildAuth(c: Credentials): string {
   if (c.mech === "PLAIN" && c.password) {
     const b64 = Buffer.from(`${c.username}:${c.password}`).toString("base64");
     return `Basic ${b64}`;
@@ -491,19 +499,19 @@ function buildAuth(c: Credentials): string {
   throw new Error(`unsupported carddav auth mech: ${c.mech}`);
 }
 
-function absolutise(origin: string, pathOrUrl: string): string {
+export function absolutise(origin: string, pathOrUrl: string): string {
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
   if (!pathOrUrl.startsWith("/")) pathOrUrl = "/" + pathOrUrl;
   return origin + pathOrUrl;
 }
 
-function leafName(href: string): string {
+export function leafName(href: string): string {
   const trimmed = href.replace(/\/+$/, "");
   const idx = trimmed.lastIndexOf("/");
   return decodeURIComponent(idx >= 0 ? trimmed.slice(idx + 1) : trimmed);
 }
 
-function escapeXml(s: string): string {
+export function escapeXml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -604,7 +612,7 @@ export function pickHref(xml: string, parentLocalName: string): string | null {
   return extractHref(m[1]);
 }
 
-function decodeXmlText(s: string): string {
+export function decodeXmlText(s: string): string {
   return s
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_m, p1: string) => p1)
     .replace(/&lt;/g, "<")

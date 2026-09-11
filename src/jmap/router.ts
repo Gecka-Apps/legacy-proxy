@@ -42,6 +42,21 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "./methods/contacts.js";
+import {
+  calendarChanges,
+  calendarEventChanges,
+  calendarEventGet,
+  calendarEventParse,
+  calendarEventQuery,
+  calendarEventQueryChanges,
+  calendarEventSet,
+  calendarGet,
+  calendarSet,
+  calendarsAvailable,
+  participantIdentityGet,
+  participantIdentitySet,
+} from "./methods/calendar.js";
+import { sieveScriptChanges, sieveScriptGet, sieveScriptSet, sieveScriptValidate } from "./methods/sieve.js";
 import { threadGet, threadChanges } from "./methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "./methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -264,7 +279,81 @@ export function makeMethodTable(): Record<string, Handler> {
     },
     "VacationResponse/changes": async (a, c) =>
       vacationChanges(a as never, { account: c.account, store: c.store }),
+    "SieveScript/get": async (a, c) => sieveScriptGet(a as never, await sieveCtx(c)),
+    "SieveScript/set": async (a, c) => sieveScriptSet(a as never, await sieveCtx(c)),
+    "SieveScript/validate": async (a, c) => sieveScriptValidate(a as never, await sieveCtx(c)),
+    "SieveScript/changes": async (a, c) => sieveScriptChanges(a as never, { account: c.account, store: c.store }),
+    "Calendar/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyGet(a, c);
+      return calendarGet(a as never, await calendarCtx(c, provider));
+    },
+    "Calendar/set": async (a, c) => calendarSet(a as never, await calendarCtx(c)),
+    "Calendar/changes": async (a, c) => calendarChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyGet(a, c);
+      return calendarEventGet(a as never, await calendarCtx(c, provider));
+    },
+    "CalendarEvent/query": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyQuery(a, c);
+      return calendarEventQuery(a as never, await calendarCtx(c, provider));
+    },
+    "CalendarEvent/set": async (a, c) => calendarEventSet(a as never, await calendarCtx(c)),
+    "CalendarEvent/changes": async (a, c) => calendarEventChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/queryChanges": async (a, c) => calendarEventQueryChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/parse": async (a, c) => calendarEventParse(a as never, await calendarCtx(c)),
+    "ParticipantIdentity/get": async (a, c) => participantIdentityGet(a as never, { account: c.account, store: c.store }),
+    "ParticipantIdentity/set": async (a, c) => participantIdentitySet(a as never, { account: c.account, store: c.store }),
+    // Scheduling inbox notifications need server-side iTIP processing, which
+    // a CalDAV store without scheduling support (Radicale) cannot provide.
+    // Empty answers let a client that always asks (Bulwark) carry on.
+    "CalendarEventNotification/get": async (a, c) => emptyGet(a, c),
+    "CalendarEventNotification/query": async (a, c) => emptyQuery(a, c),
+    "CalendarEventNotification/set": async (a, c) => ({
+      accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+      oldState: "0",
+      newState: "0",
+      created: null,
+      updated: null,
+      destroyed: ((a as { destroy?: string[] | null }).destroy ?? []) as string[],
+      notCreated: null,
+      notUpdated: null,
+      notDestroyed: null,
+    }),
   };
+}
+
+function emptyGet(a: Record<string, unknown>, c: Ctx) {
+  return {
+    accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+    state: "0",
+    list: [],
+    notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+  };
+}
+
+function emptyQuery(a: Record<string, unknown>, c: Ctx) {
+  return {
+    accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+    queryState: "0",
+    canCalculateChanges: false,
+    position: 0,
+    total: 0,
+    ids: [],
+  };
+}
+
+async function sieveCtx(c: Ctx) {
+  const provider = resolveProvider(c.cfg, c.account.kind);
+  const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+  return { account: c.account, provider, creds, store: c.store };
+}
+
+async function calendarCtx(c: Ctx, provider = resolveProvider(c.cfg, c.account.kind)) {
+  const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+  return { account: c.account, provider, creds, store: c.store, pool: c.pool };
 }
 
 const TABLE = makeMethodTable();
@@ -303,6 +392,24 @@ const METHOD_CAPABILITY: Record<string, string> = {
   "VacationResponse/changes": "urn:ietf:params:jmap:vacationresponse",
   "PushSubscription/get": "urn:ietf:params:jmap:core",
   "PushSubscription/set": "urn:ietf:params:jmap:core",
+  "SieveScript/get": "urn:ietf:params:jmap:sieve",
+  "SieveScript/set": "urn:ietf:params:jmap:sieve",
+  "SieveScript/validate": "urn:ietf:params:jmap:sieve",
+  "SieveScript/changes": "urn:ietf:params:jmap:sieve",
+  "Calendar/get": "urn:ietf:params:jmap:calendars",
+  "Calendar/set": "urn:ietf:params:jmap:calendars",
+  "Calendar/changes": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/get": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/query": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/set": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/changes": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/queryChanges": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/parse": "urn:ietf:params:jmap:calendars",
+  "ParticipantIdentity/get": "urn:ietf:params:jmap:calendars",
+  "ParticipantIdentity/set": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/get": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/query": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/set": "urn:ietf:params:jmap:calendars",
 };
 // Methods that only read. A run of these, none of which references an earlier
 // call, can be executed together instead of one after another.
@@ -343,6 +450,18 @@ const PARALLEL_SAFE_METHODS = new Set([
   "ContactCard/changes",
   "ContactCard/queryChanges",
   "PushSubscription/get",
+  "SieveScript/get",
+  "SieveScript/changes",
+  "Calendar/get",
+  "Calendar/changes",
+  "CalendarEvent/get",
+  "CalendarEvent/query",
+  "CalendarEvent/changes",
+  "CalendarEvent/queryChanges",
+  "CalendarEvent/parse",
+  "ParticipantIdentity/get",
+  "CalendarEventNotification/get",
+  "CalendarEventNotification/query",
 ]);
 
 // Ceiling on how many calls from one envelope run at once. The interactive

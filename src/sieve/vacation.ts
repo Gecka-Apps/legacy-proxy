@@ -3,8 +3,13 @@
 // generating a Sieve script with structured marker comments, then parse those
 // markers back on read. This keeps state in the user's mail provider rather
 // than another local database — the right place for it.
+//
+// The script is named `vacation` (RFC 9661 §4) and is activated through the
+// wrapper described in ./manager.ts, so a user's filter script and the
+// autoresponder can both run on a single-active-script server.
 
 import type { SieveClient } from "./client.js";
+import { VACATION_NAME, ensureVacationWired, isNonexistent } from "./manager.js";
 
 export interface VacationProps {
   isEnabled: boolean;
@@ -15,14 +20,15 @@ export interface VacationProps {
   htmlBody?: string | null;
 }
 
-const SCRIPT_NAME = "bulwark-vacation";
+/** Name used before the RFC 9661 rename; migrated on first read. */
+const LEGACY_SCRIPT_NAME = "bulwark-vacation";
 
 export function generateScript(v: VacationProps): string {
   // Markers are stored on dedicated comment lines so re-reading the script
   // can recover what the user typed even when the autoresponder is disabled.
   // We only emit the actual `vacation` action when enabled; otherwise the
   // script contains markers + a no-op so the server still has something to
-  // load and `SETACTIVE ""` is what disables it.
+  // load and the wrapper's include stays harmless.
   const markers = [
     markerLine("subject", v.subject),
     markerLine("from", v.fromDate),
@@ -81,26 +87,45 @@ function readMarker(script: string, key: string): string | null {
   }
 }
 
+/** Whether a generated script carries a live `vacation` action. */
+export function scriptIsEnabled(script: string): boolean {
+  if (/^#\s*bulwark-vacation:\s*enabled\s*$/m.test(script)) return true;
+  if (/^#\s*bulwark-vacation:\s*disabled\s*$/m.test(script)) return false;
+  return /^\s*vacation\b/m.test(script);
+}
+
 function escape(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+const EMPTY: VacationProps = { isEnabled: false, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
+
 export async function readVacation(client: SieveClient): Promise<VacationProps> {
   const list = await client.listScripts();
-  const ours = list.find((s) => s.name === SCRIPT_NAME);
+  let ours = list.find((s) => s.name === VACATION_NAME);
   if (!ours) {
-    return { isEnabled: false, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
+    const legacy = list.find((s) => s.name === LEGACY_SCRIPT_NAME);
+    if (!legacy) return { ...EMPTY };
+    // Installs that predate the rename: move the script under its RFC name
+    // so it is wired into the wrapper from now on.
+    try {
+      await client.renameScript(LEGACY_SCRIPT_NAME, VACATION_NAME);
+      ours = { name: VACATION_NAME, active: legacy.active };
+    } catch (e) {
+      if (isNonexistent(e)) return { ...EMPTY };
+      throw e;
+    }
   }
   let body = "";
   try {
-    body = await client.getScript(SCRIPT_NAME);
+    body = await client.getScript(VACATION_NAME);
   } catch {
     // Some servers return NO if the script is empty. Treat as a blank
     // autoresponder so /get doesn't error out.
-    return { isEnabled: ours.active, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
+    return { ...EMPTY, isEnabled: ours.active };
   }
   return {
-    isEnabled: ours.active,
+    isEnabled: scriptIsEnabled(body),
     subject: readMarker(body, "subject"),
     textBody: readMarker(body, "text"),
     htmlBody: readMarker(body, "html"),
@@ -111,13 +136,6 @@ export async function readVacation(client: SieveClient): Promise<VacationProps> 
 
 export async function writeVacation(client: SieveClient, v: VacationProps): Promise<void> {
   const body = generateScript(v);
-  await client.putScript(SCRIPT_NAME, body);
-  if (v.isEnabled) {
-    await client.setActive(SCRIPT_NAME);
-  } else {
-    // RFC 5804 §2.8: SETACTIVE with an empty script name deactivates the
-    // currently active script. Without this, disabling the responder leaves
-    // the server still running our previous script.
-    await client.setActive("");
-  }
+  await client.putScript(VACATION_NAME, body);
+  await ensureVacationWired(client, v.isEnabled);
 }

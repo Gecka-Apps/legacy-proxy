@@ -17,6 +17,10 @@ import { EventSourceHub } from "./jmap/eventsource.js";
 import { openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
+import { probeSieveCapabilities } from "./sieve/capabilities.js";
+import { fetchScriptBody, scriptNameFromBlobId } from "./jmap/methods/sieve.js";
+import { CalDavClient } from "./caldav/client.js";
+import { CardDavClient } from "./carddav/client.js";
 
 const cfg = loadConfig();
 const store = new Store(cfg.dataDir);
@@ -119,7 +123,14 @@ app.get("/jmap/session", async (req, reply) => {
   } catch {
     provider = undefined;
   }
-  return buildSession(cfg, account, provider);
+  // The RFC 9661 capability object lists the server's Sieve extensions; the
+  // probe is memoised per provider so only the first session pays for it.
+  let sieve;
+  if (provider?.sieve) {
+    const creds = await openCredentials(cfg.vaultKey, account.vault);
+    sieve = await probeSieveCapabilities(account.kind, provider, creds);
+  }
+  return buildSession(cfg, account, provider, { sieve });
 });
 
 app.post("/jmap", async (req, reply) => {
@@ -176,6 +187,20 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     // implicitly, just allow the small standard set used by JMAP clients.
     const requestedType = decodeURIComponent(req.params.type ?? "");
     const allowedType = /^[\w.+-]+\/[\w.+-]+$/.test(requestedType) ? requestedType : null;
+
+    // Sieve script bodies (RFC 9661) come from a live GETSCRIPT; the blobId
+    // encodes the script name, see jmap/methods/sieve.ts.
+    const sieveScript = scriptNameFromBlobId(req.params.blobId);
+    if (sieveScript !== null) {
+      const provider = resolveProvider(cfg, account.kind);
+      if (!provider.sieve) return reply.code(404).send({ error: "blob not found" });
+      const creds = await openCredentials(cfg.vaultKey, account.vault);
+      const body = await fetchScriptBody({ account, provider, creds, store }, sieveScript);
+      if (body === null) return reply.code(404).send({ error: "blob not found" });
+      reply.header("Content-Type", allowedType ?? "application/sieve");
+      reply.header("Content-Disposition", `attachment; filename="${encodeURIComponent(req.params.name)}"`);
+      return reply.send(body);
+    }
 
     // Uploaded blobs are served straight from SQLite. Email-backed blobs need
     // an IMAP fetch keyed by mailbox + UID + (optional) part id.
@@ -367,6 +392,96 @@ app.post<{ Params: { accountId: string } }>(
     };
   },
 );
+
+// -- /dav/{cal|card}/{username}/… ---------------------------------------------
+//
+// Stalwart exposes its collections at /dav/cal/<user>/ and /dav/card/<user>/,
+// and the Bulwark webmail addresses them directly for the one thing JMAP
+// cannot express: MKCALENDAR with a supported-calendar-component-set. Mirror
+// those paths here and forward the request to the DAV backend's home set
+// with the account's own credentials, so the webmail's WebDAV proxy keeps
+// working unchanged. `/dav/file/` (Stalwart's file storage) has no
+// counterpart and answers 404.
+const DAV_METHODS = ["PROPFIND", "PROPPATCH", "MKCOL", "MKCALENDAR", "REPORT", "MOVE", "COPY"];
+for (const m of DAV_METHODS) app.addHttpMethod(m, { hasBody: true });
+const DAV_FORWARD_HEADERS = ["content-type", "depth", "if-match", "if-none-match", "overwrite", "prefer"];
+
+app.route<{ Params: { collection: string; username: string; "*": string } }>({
+  method: [...DAV_METHODS, "GET", "PUT", "DELETE", "HEAD", "OPTIONS"],
+  url: "/dav/:collection/:username/*",
+  handler: async (req, reply) => {
+    const account = await authn(req);
+    if (!account) return send401(reply);
+    if (decodeURIComponent(req.params.username) !== account.username) return reply.code(404).send({ error: "not found" });
+    const provider = resolveProvider(cfg, account.kind);
+    const creds = await openCredentials(cfg.vaultKey, account.vault);
+
+    let home: string;
+    let forward: (method: string, href: string, body: Buffer | null, headers: Record<string, string>) => Promise<Response>;
+    if (req.params.collection === "cal" && provider.caldav) {
+      const client = new CalDavClient({ ...provider.caldav, creds });
+      home = await client.calendarHome();
+      forward = (m, h, b, hd) => client.proxy(m, h, b, hd);
+    } else if (req.params.collection === "card" && provider.carddav) {
+      const client = new CardDavClient({ ...provider.carddav, creds });
+      home = await client.addressBookHome();
+      forward = (m, h, b, hd) => client.proxy(m, h, b, hd);
+    } else {
+      return reply.code(404).send({ error: "not found" });
+    }
+
+    const rest = safeDavPath(req.params["*"] ?? "");
+    if (rest === null) return reply.code(400).send({ error: "bad path" });
+    const headers: Record<string, string> = {};
+    for (const h of DAV_FORWARD_HEADERS) {
+      const v = req.headers[h];
+      if (typeof v === "string") headers[h] = v;
+    }
+    const dest = req.headers["destination"];
+    if (typeof dest === "string") {
+      const prefix = `/dav/${req.params.collection}/${req.params.username}/`;
+      let path: string;
+      try {
+        path = new URL(dest, cfg.publicUrl).pathname;
+      } catch {
+        return reply.code(400).send({ error: "bad destination" });
+      }
+      if (!path.startsWith(prefix)) return reply.code(400).send({ error: "bad destination" });
+      const destRest = safeDavPath(path.slice(prefix.length));
+      if (destRest === null) return reply.code(400).send({ error: "bad destination" });
+      headers["destination"] = home + destRest;
+    }
+    const raw = req.body;
+    const body = Buffer.isBuffer(raw) ? raw : typeof raw === "string" ? Buffer.from(raw, "utf8") : raw instanceof Uint8Array ? Buffer.from(raw) : null;
+    const res = await forward(req.method, home + rest, body, headers);
+    const text = Buffer.from(await res.arrayBuffer());
+    reply.code(res.status);
+    for (const h of ["content-type", "etag", "dav", "allow"]) {
+      const v = res.headers.get(h);
+      if (v) reply.header(h, v);
+    }
+    return reply.send(text);
+  },
+});
+
+/** Percent-encoded relative path with no traversal, or null. */
+function safeDavPath(raw: string): string | null {
+  const segments = raw.split("/");
+  const out: string[] = [];
+  for (const seg of segments) {
+    if (seg === "") continue;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(seg);
+    } catch {
+      return null;
+    }
+    if (decoded === "." || decoded === ".." || decoded.includes("/") || decoded.includes("\\") || decoded.includes("\0")) return null;
+    out.push(encodeURIComponent(decoded));
+  }
+  const joined = out.join("/");
+  return raw.endsWith("/") && joined ? joined + "/" : joined;
+}
 
 app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>(
   "/jmap/eventsource",

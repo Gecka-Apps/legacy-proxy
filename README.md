@@ -6,10 +6,11 @@
 
 ## About
 
-`legacy-proxy` is a translation layer that puts a JMAP for Mail server in
-front of a classic IMAP / SMTP / ManageSieve / CardDAV stack. It speaks
-RFC 8620 + RFC 8621 to clients, and standard mailbox protocols to whatever
-server already holds the user's mail. No new mail store, no migration: the
+`legacy-proxy` is a translation layer that puts a JMAP server in front of a
+classic IMAP / SMTP / ManageSieve / CardDAV / CalDAV stack. It speaks
+RFC 8620 + RFC 8621 (mail), RFC 9610 (contacts), RFC 9661 (Sieve scripts)
+and draft-ietf-jmap-calendars to clients, and standard mailbox protocols to
+whatever server already holds the user's mail. No new mail store, no migration: the
 mail keeps living in the existing IMAP server, and a modern JMAP client
 sees the account as if it were native.
 
@@ -63,6 +64,11 @@ JMAP method coverage:
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
+| SieveScript       | `get`, `set` (incl. `onSuccessActivateScript`), `validate`, `changes` via ManageSieve |
+| Calendar          | `get`, `changes`, `set` (MKCALENDAR / PROPPATCH / DELETE via CalDAV)  |
+| CalendarEvent     | `get`, `query` (time-range REPORT), `queryChanges`, `changes`, `set`, `parse` |
+| ParticipantIdentity | `get`, `set` (single identity derived from the login)              |
+| CalendarEventNotification | `get`, `query`, `set` (stubs returning empty lists)           |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -72,6 +78,9 @@ Capabilities advertised on the Session resource:
 - `urn:ietf:params:jmap:submission`
 - `urn:ietf:params:jmap:vacationresponse`
 - `urn:ietf:params:jmap:contacts` (only when the active provider has CardDAV)
+- `urn:ietf:params:jmap:calendars` (only when the active provider has CalDAV)
+- `urn:ietf:params:jmap:sieve` (only when the active provider has ManageSieve;
+  the capability object lists the extensions the server announced)
 - `urn:bulwark:params:jmap:sieve` (vendor capability used by the vacation handler)
 
 Transport:
@@ -80,6 +89,10 @@ Transport:
 - `GET /jmap/download/{accountId}/{blobId}/{type}/{name}` for both
   IMAP-backed message blobs and previously-uploaded blobs.
 - `POST /jmap/upload/{accountId}` with a 24h retention sweep.
+- `/dav/cal/{username}/…` and `/dav/card/{username}/…`: authenticated
+  pass-through to the CalDAV / CardDAV home set, mirroring Stalwart's paths so
+  the Bulwark webmail's own WebDAV proxy (used for `MKCALENDAR` with a
+  component set) works unchanged.
 - `GET /jmap/eventsource` (RFC 8620 §7.3). Real `state` events on every counter
   bump, with `types`, `closeafter`, and `ping` query params.
 - `PushSubscription/set` runs a one-shot `PushVerification` POST against the
@@ -95,7 +108,15 @@ Backends:
 
 - IMAP via [imapflow](https://github.com/postalsys/imapflow), one connection
   per account in a request-path pool (separate from the IDLE socket).
-- ManageSieve (RFC 5804) for the vacation autoresponder.
+- ManageSieve (RFC 5804) for the vacation autoresponder and for RFC 9661
+  `SieveScript/*`. ManageSieve servers run one active script, while JMAP for
+  Sieve (and the Bulwark filter editor) expect a server-managed `vacation`
+  script to run alongside the user's active script. When the server offers
+  the `include` extension the proxy keeps a wrapper script named `bulwark`
+  active — `include :personal :optional "vacation"; include … "<user script>"`
+  — and hides it from clients; "active" then means "included by the wrapper".
+  Without `include` it falls back to plain `SETACTIVE`, so activating a
+  filter script silences the autoresponder and vice versa.
 - SMTP Submission via nodemailer.
 - CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
   PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
@@ -106,6 +127,19 @@ Backends:
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
   `ContactCard/set`.
+- CalDAV (RFC 4791) for Calendar and CalendarEvent. Calendars are the
+  collections under `calendar-home-set`; events are `.ics` resources, one
+  UID per resource, translated to and from JSCalendar (RFC 8984) with
+  [ical.js](https://github.com/kewisch/ical.js). Recurrence rules, EXDATE /
+  RDATE and RECURRENCE-ID overrides map to `recurrenceRules` /
+  `recurrenceOverrides`; ATTENDEE / ORGANIZER to `participants`; VALARM to
+  `alerts`. Time-range queries are `calendar-query` REPORTs, so the server
+  does the recurrence-aware overlap test and the client expands occurrences
+  (`expandRecurrences` is not implemented). Every TZID a resource references
+  gets a synthesised VTIMEZONE. Calendar properties CalDAV cannot hold
+  (`isVisible`, `sortOrder`, default alerts, …) live in the proxy's SQLite
+  database. An account with no calendar gets a `Calendar` collection created
+  on the first `CalendarEvent/set`.
 
 Auth and storage:
 
@@ -131,6 +165,16 @@ Sort and filter:
   proxy returns `cannotCalculateChanges`.
 
 ## Not implemented
+
+- Scheduling: `sendSchedulingMessages` on `CalendarEvent/set` is accepted but
+  no iMIP message is sent, and the CalDAV server is not asked to schedule
+  either. Invitations received by mail can be parsed (`CalendarEvent/parse`)
+  and saved as events. `Principal/*` and free/busy are not exposed.
+- `CalendarEvent/query` `expandRecurrences`. The client is expected to expand
+  recurring events itself; the probe Bulwark uses to detect server-side
+  expansion is answered with `invalidProperties` so it keeps doing so.
+- Sieve scripts can only be activated one at a time on top of `vacation`;
+  the `include` wrapper covers exactly that pair.
 
 - WebSocket transport (`@fastify/websocket` is in the deps tree but no `/jmap/ws`
   handler is registered, so the capability is not advertised).
@@ -294,10 +338,15 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 
 `providers.example.json` ships entries for Gmail and a generic
-`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
-A `null` for any of `sieve` or `carddav` is allowed; the corresponding JMAP
-methods will then either return empty results or, for vacation, reject with
-the underlying ManageSieve error. An optional `domains` array on a provider
+`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
+template. A `null` (or absent) `sieve`, `carddav` or `caldav` is allowed; the
+corresponding capability is then not advertised and the JMAP methods either
+return empty results or, for vacation, reject with the underlying ManageSieve
+error. `carddav` and `caldav` share the same shape (`host`, `port`, `secure`,
+`basePath`, optional `principalPath`) and usually point at the same server —
+Radicale, Baïkal, SOGo, Nextcloud, Stalwart… The DAV backend must accept the
+user's IMAP credentials: the proxy replays them (Radicale's
+`[auth] type = dovecot` or `imap` does exactly that). An optional `domains` array on a provider
 opts it into domain-based [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 
@@ -327,11 +376,14 @@ src/
   server.ts        fastify bootstrap, auth, upload/download/eventsource routes
   jmap/            session, router, capabilities, errors, refs, eventsource hub
     methods/       per-type handlers (mailbox, email, threads, identity,
-                   submission, vacation, contacts, push)
+                   submission, vacation, sieve, contacts, calendar, push)
   imap/            imapflow client/pool, fetcher, search compiler, header parsing
   smtp/            nodemailer submission
-  sieve/           ManageSieve client, vacation script generator
+  sieve/           ManageSieve client, capability probe, wrapper-script manager,
+                   vacation script generator
   carddav/         CardDAV client + vCard / JSContact translation
+  caldav/          CalDAV client, iCalendar / JSCalendar translation, Intl-based
+                   time-zone arithmetic + VTIMEZONE synthesis
   push/            PushDispatcher (SSE + relay fan-out), PushIdleManager
   auth/            session tokens, AES-256-GCM credential vault, providers
   mapping/         IMAP <-> JMAP id/blobId codecs, flag map, body structure,
