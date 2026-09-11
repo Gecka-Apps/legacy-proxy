@@ -8,26 +8,42 @@
 // autoresponder through VacationResponse/set. Dovecot/Pigeonhole, like every
 // other ManageSieve server, executes exactly one active script.
 //
-// When the server offers the `include` extension (RFC 6609) we bridge the gap
-// with a wrapper script the client never sees:
+// With the `include` extension (RFC 6609) the active script can be a
+// *master* that includes the others. Two cases:
 //
-//   require ["include"];
-//   include :personal :optional "vacation";
-//   include :personal :optional "filters";
+// 1. The user (or their admin) already runs such a master — a hand-written
+//    `default` that includes the script Roundcube manages, say. It is
+//    adopted as is: the proxy only adds its own two lines, tagged with a
+//    trailing `# legacy-proxy` comment so they can be found and updated
+//    again, and never edits anything else in it.
 //
-// The wrapper is what SETACTIVE points at; "active" from the client's point
-// of view means "listed in the wrapper". Without `include` we fall back to
-// plain SETACTIVE semantics, so activating a filter script silences the
-// autoresponder and vice versa — the best a single-script server can do.
+//      include :personal :optional "vacation"; # legacy-proxy
+//      include :personal "filters"; # legacy-proxy
+//
+//    The script the master includes is what the JMAP client sees as active
+//    (so it opens and edits the existing Roundcube script). Switching to
+//    another script comments the previous include out rather than deleting
+//    it (`# legacy-proxy disabled: …`).
+//
+// 2. No master exists (nothing active, or a plain script is active). The
+//    proxy writes its own, named `bulwark`, and activates it.
+//
+// The master is hidden from JMAP clients either way. Without `include` we
+// fall back to plain SETACTIVE semantics, so activating a filter script
+// silences the autoresponder and vice versa — the best a single-script
+// server can do.
 
 import { SieveClient, SieveCommandError, type SieveScriptInfo } from "./client.js";
 
-/** Name of the proxy-managed wrapper script. Hidden from JMAP clients. */
+/** Name of the proxy-written master script (case 2). */
 export const WRAPPER_NAME = "bulwark";
 /** RFC 9661 §4: the autoresponder lives in a script literally named "vacation". */
 export const VACATION_NAME = "vacation";
 
 const WRAPPER_HEADER = "# Managed by legacy-proxy: activates the user's scripts via include.";
+/** Trailing comment on the lines the proxy adds to a foreign master. */
+const OURS = "# legacy-proxy";
+const DISABLED = "# legacy-proxy disabled: ";
 
 export interface ScriptView {
   name: string;
@@ -39,7 +55,13 @@ export function supportsInclude(client: SieveClient): boolean {
   return client.serverCapabilities().extensions.map((e) => e.toLowerCase()).includes("include");
 }
 
-/** Wrapper body activating `vacation` (always) and the given user script. */
+function escapeString(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+// -- master script bodies --------------------------------------------------------
+
+/** Our own master body activating `vacation` (always) and the given user script. */
 export function buildWrapper(userScript: string | null): string {
   const lines = [
     WRAPPER_HEADER,
@@ -50,91 +72,195 @@ export function buildWrapper(userScript: string | null): string {
   return lines.join("\r\n") + "\r\n";
 }
 
-/** Names included by a wrapper body, in order. Returns [] for a foreign script. */
-export function parseWrapper(body: string): string[] {
-  if (!body.startsWith(WRAPPER_HEADER)) return [];
-  const out: string[] = [];
-  const re = /^\s*include\b[^"]*"((?:[^"\\]|\\.)*)"\s*;/gm;
+export interface IncludeLine {
+  name: string;
+  /** `:global` includes come from the server's shared directory; never a user script. */
+  global: boolean;
+  /** Carries our `# legacy-proxy` tag. */
+  ours: boolean;
+}
+
+const INCLUDE_RE = /^[ \t]*include\b([^"\r\n]*)"((?:[^"\\]|\\.)*)"[ \t]*;[ \t]*(#[^\r\n]*)?$/gm;
+
+/** Live (uncommented) `include` statements of a script, in order. */
+export function parseIncludes(body: string): IncludeLine[] {
+  const out: IncludeLine[] = [];
   let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    if (m[1] !== undefined) out.push(m[1].replace(/\\(.)/g, "$1"));
+  INCLUDE_RE.lastIndex = 0;
+  while ((m = INCLUDE_RE.exec(body)) !== null) {
+    out.push({
+      name: (m[2] ?? "").replace(/\\(.)/g, "$1"),
+      global: /:global\b/.test(m[1] ?? ""),
+      ours: (m[3] ?? "").trim() === OURS,
+    });
   }
   return out;
 }
 
-function escapeString(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+/** Names included by our own master body. Returns [] for a foreign script. */
+export function parseWrapper(body: string): string[] {
+  if (!body.startsWith(WRAPPER_HEADER)) return [];
+  return parseIncludes(body).map((i) => i.name);
+}
+
+export function isOurWrapperBody(body: string): boolean {
+  return body.startsWith(WRAPPER_HEADER);
+}
+
+/** A script acts as a master when it includes other personal scripts. */
+export function isMasterBody(body: string): boolean {
+  return isOurWrapperBody(body) || parseIncludes(body).some((i) => !i.global);
 }
 
 /**
- * Scripts as the JMAP client should see them: the wrapper is dropped and
- * `isActive` is derived from the wrapper's includes when one is active.
+ * The user script a master runs: our tagged include when present, else the
+ * first personal include that is not the vacation script.
+ */
+export function userScriptOf(body: string): string | null {
+  const personal = parseIncludes(body).filter((i) => !i.global && i.name !== VACATION_NAME);
+  return (personal.find((i) => i.ours) ?? personal[0])?.name ?? null;
+}
+
+/**
+ * Rewrite a foreign master so that it runs `vacation` and exactly `name`
+ * (null: no user script). Only lines we own change: our tagged includes are
+ * replaced, a foreign include of another user script is commented out, and
+ * a commented-out include of `name` is brought back.
+ */
+export function retargetMaster(body: string, name: string | null): string {
+  const eol = body.includes("\r\n") ? "\r\n" : "\n";
+  const lines = body.split(/\r?\n/);
+  const out: string[] = [];
+  let hasVacation = false;
+  let hasTarget = false;
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    // Re-enable a line we disabled earlier when it is the one wanted now.
+    if (line.trimStart().startsWith(DISABLED)) {
+      const original = line.trimStart().slice(DISABLED.length);
+      const inc = parseIncludes(original)[0];
+      if (inc && name !== null && inc.name === name && !inc.global) {
+        out.push(original);
+        hasTarget = true;
+      } else {
+        out.push(raw);
+      }
+      continue;
+    }
+    const inc = parseIncludes(line)[0];
+    if (!inc || inc.global) {
+      out.push(raw);
+      continue;
+    }
+    if (inc.name === VACATION_NAME) {
+      hasVacation = true;
+      out.push(raw);
+      continue;
+    }
+    if (name !== null && inc.name === name) {
+      hasTarget = true;
+      out.push(raw);
+      continue;
+    }
+    // Another user script: ours goes away, theirs is switched off in place.
+    if (inc.ours) continue;
+    out.push(`${DISABLED}${line}`);
+  }
+
+  // Drop trailing blank lines so our additions sit right after the content.
+  while (out.length && out[out.length - 1]!.trim() === "") out.pop();
+  if (!hasVacation) out.push(`include :personal :optional "${escapeString(VACATION_NAME)}"; ${OURS}`);
+  if (name !== null && !hasTarget) out.push(`include :personal "${escapeString(name)}"; ${OURS}`);
+  let result = out.join(eol) + eol;
+  if (!/^\s*require\b[^;]*\binclude\b/m.test(result)) result = `require ["include"];${eol}${result}`;
+  return result;
+}
+
+// -- server state ---------------------------------------------------------------
+
+interface Master {
+  name: string;
+  body: string;
+  ours: boolean;
+}
+
+/** The active master script, if the active script is one. */
+async function activeMaster(client: SieveClient, raw: SieveScriptInfo[]): Promise<Master | null> {
+  const active = raw.find((s) => s.active);
+  if (!active) return null;
+  let body: string;
+  try {
+    body = await client.getScript(active.name);
+  } catch (e) {
+    if (isNonexistent(e)) return null;
+    throw e;
+  }
+  if (!isMasterBody(body)) return null;
+  return { name: active.name, body, ours: isOurWrapperBody(body) };
+}
+
+/**
+ * Scripts as the JMAP client should see them: the master is dropped and
+ * `isActive` is derived from what the master includes.
  */
 export async function listScriptsView(client: SieveClient): Promise<ScriptView[]> {
   const raw = await client.listScripts();
-  return projectScripts(raw, await activeUserScript(client, raw), await wrapperOwnedByUs(client, raw));
+  const master = await activeMaster(client, raw);
+  return projectScripts(raw, activeUserScriptFrom(raw, master), master?.name ?? null);
 }
 
-/**
- * `hideWrapper` is false when a script named like the wrapper is really the
- * user's (see rescueForeignWrapper); it then stays visible.
- */
-export function projectScripts(raw: SieveScriptInfo[], activeUser: string | null, hideWrapper = true): ScriptView[] {
-  return raw
-    .filter((s) => !(hideWrapper && s.name === WRAPPER_NAME))
-    .map((s) => ({ name: s.name, isActive: s.name === activeUser }));
+/** `hidden` is the master's name (or null when no master is active). */
+export function projectScripts(raw: SieveScriptInfo[], activeUser: string | null, hidden: string | null): ScriptView[] {
+  return raw.filter((s) => s.name !== hidden).map((s) => ({ name: s.name, isActive: s.name === activeUser }));
 }
 
-/** True when no script wears the wrapper's name, or the one that does is ours. */
-export async function wrapperOwnedByUs(client: SieveClient, raw: SieveScriptInfo[]): Promise<boolean> {
-  if (!raw.some((s) => s.name === WRAPPER_NAME)) return true;
-  return isOurWrapper(client);
+function activeUserScriptFrom(raw: SieveScriptInfo[], master: Master | null): string | null {
+  if (master) return userScriptOf(master.body);
+  const active = raw.find((s) => s.active);
+  if (!active || active.name === VACATION_NAME) return null;
+  return active.name;
 }
 
-/**
- * The user script that is effectively active: the one the wrapper includes
- * (besides `vacation`) when the wrapper is active; otherwise the script the
- * server itself marks ACTIVE, unless that is the vacation script.
- */
-export async function activeUserScript(client: SieveClient, raw?: SieveScriptInfo[]): Promise<string | null> {
+/** What a JMAP client should consider the active script, plus the master to hide. */
+export async function activeUserScript(client: SieveClient, raw?: SieveScriptInfo[]): Promise<{ active: string | null; hidden: string | null }> {
   const list = raw ?? (await client.listScripts());
-  const active = list.find((s) => s.active);
-  if (!active) return null;
-  if (active.name === WRAPPER_NAME) {
-    const body = await client.getScript(WRAPPER_NAME);
-    // Not ours (yet): a user script that happens to wear the name.
-    if (!body.startsWith(WRAPPER_HEADER)) return active.name;
-    return parseWrapper(body).find((n) => n !== VACATION_NAME) ?? null;
-  }
-  return active.name === VACATION_NAME ? null : active.name;
+  const master = await activeMaster(client, list);
+  return { active: activeUserScriptFrom(list, master), hidden: master?.name ?? null };
 }
 
 /**
  * Make `name` the active user script (`null` deactivates). With `include`
- * support this rewrites and activates the wrapper so the autoresponder keeps
- * running; without it, it is a plain SETACTIVE.
+ * support the active master is retargeted (or created), so the autoresponder
+ * keeps running; without it, it is a plain SETACTIVE.
  */
 export async function activateUserScript(client: SieveClient, name: string | null): Promise<void> {
-  if (supportsInclude(client)) {
-    const displaced = await rescueForeignWrapper(client);
-    // The user's own script wore our name: it keeps being the active one,
-    // under its new name, unless the caller asked for something else.
-    const target = name === WRAPPER_NAME ? displaced ?? null : name;
-    await client.putScript(WRAPPER_NAME, buildWrapper(target));
-    await client.setActive(WRAPPER_NAME);
+  if (!supportsInclude(client)) {
+    await client.setActive(name ?? "");
     return;
   }
-  await client.setActive(name ?? "");
+  const raw = await client.listScripts();
+  const master = await activeMaster(client, raw);
+  if (master && !master.ours) {
+    if (name === master.name) throw new Error(`"${name}" is the active master script and cannot include itself`);
+    await client.putScript(master.name, retargetMaster(master.body, name));
+    return;
+  }
+  const displaced = await rescueForeignWrapper(client, raw);
+  // The user's own script wore our name: it keeps being the active one,
+  // under its new name, unless the caller asked for something else.
+  const target = name === WRAPPER_NAME ? (displaced ?? null) : name;
+  await client.putScript(WRAPPER_NAME, buildWrapper(target));
+  await client.setActive(WRAPPER_NAME);
 }
 
 /**
- * A script named like the wrapper that we did not write (a user who picked
- * "bulwark" as a name before the proxy existed) must not be overwritten.
- * Rename it to the first free `bulwark-N` and return the new name.
+ * A plain script named like our wrapper that we did not write (a user who
+ * picked "bulwark" as a name before the proxy existed) must not be
+ * overwritten. Rename it to the first free `bulwark-N` and return the name.
  */
-async function rescueForeignWrapper(client: SieveClient): Promise<string | null> {
-  const list = await client.listScripts();
-  if (!list.some((s) => s.name === WRAPPER_NAME)) return null;
+async function rescueForeignWrapper(client: SieveClient, raw: SieveScriptInfo[]): Promise<string | null> {
+  if (!raw.some((s) => s.name === WRAPPER_NAME)) return null;
   let body: string;
   try {
     body = await client.getScript(WRAPPER_NAME);
@@ -142,8 +268,8 @@ async function rescueForeignWrapper(client: SieveClient): Promise<string | null>
     if (isNonexistent(e)) return null;
     throw e;
   }
-  if (body.startsWith(WRAPPER_HEADER)) return null;
-  const taken = new Set(list.map((s) => s.name));
+  if (isOurWrapperBody(body)) return null;
+  const taken = new Set(raw.map((s) => s.name));
   let n = 1;
   while (taken.has(`${WRAPPER_NAME}-${n}`)) n++;
   const fresh = `${WRAPPER_NAME}-${n}`;
@@ -152,18 +278,22 @@ async function rescueForeignWrapper(client: SieveClient): Promise<string | null>
 }
 
 /**
- * Called after the vacation script was (re)written: make sure it is wired
- * in. With `include`, the wrapper always references it, so the wrapper only
- * needs to exist and be active — if the user has a directly-activated
- * script (pre-proxy state), it is carried into the wrapper. Without
- * `include`, `enabled` decides whether the vacation script takes over the
- * single active slot.
+ * Called after the vacation script was (re)written: make sure it runs.
+ * With `include`, a master that already references it needs nothing; a
+ * foreign master gets the include added; with no master, ours is created
+ * and the currently active script carried into it. Without `include`,
+ * `enabled` decides whether the vacation script takes the single active slot.
  */
 export async function ensureVacationWired(client: SieveClient, enabled: boolean): Promise<void> {
   const raw = await client.listScripts();
   const active = raw.find((s) => s.active);
   if (supportsInclude(client)) {
-    if (active?.name === WRAPPER_NAME && (await isOurWrapper(client))) return;
+    const master = await activeMaster(client, raw);
+    if (master) {
+      if (parseIncludes(master.body).some((i) => i.name === VACATION_NAME && !i.global)) return;
+      await client.putScript(master.name, retargetMaster(master.body, userScriptOf(master.body)));
+      return;
+    }
     const carried = active && active.name !== VACATION_NAME ? active.name : null;
     await activateUserScript(client, carried);
     return;
@@ -175,12 +305,13 @@ export async function ensureVacationWired(client: SieveClient, enabled: boolean)
   }
 }
 
-async function isOurWrapper(client: SieveClient): Promise<boolean> {
-  try {
-    return (await client.getScript(WRAPPER_NAME)).startsWith(WRAPPER_HEADER);
-  } catch {
-    return false;
-  }
+/** Whether the vacation script is actually run by the active script. */
+export async function vacationIsWired(client: SieveClient, raw: SieveScriptInfo[]): Promise<boolean> {
+  const active = raw.find((s) => s.active);
+  if (!active) return false;
+  if (active.name === VACATION_NAME) return true;
+  const master = await activeMaster(client, raw);
+  return !!master && parseIncludes(master.body).some((i) => i.name === VACATION_NAME && !i.global);
 }
 
 /** True when the ManageSieve error means "no such script". */

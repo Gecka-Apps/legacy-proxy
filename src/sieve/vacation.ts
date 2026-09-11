@@ -9,7 +9,7 @@
 // autoresponder can both run on a single-active-script server.
 
 import type { SieveClient } from "./client.js";
-import { VACATION_NAME, WRAPPER_NAME, ensureVacationWired, isNonexistent, parseWrapper } from "./manager.js";
+import { VACATION_NAME, ensureVacationWired, isNonexistent, vacationIsWired } from "./manager.js";
 
 export interface VacationProps {
   isEnabled: boolean;
@@ -101,7 +101,7 @@ function escape(s: string): string {
 const EMPTY: VacationProps = { isEnabled: false, subject: null, textBody: null, htmlBody: null, fromDate: null, toDate: null };
 
 export async function readVacation(client: SieveClient): Promise<VacationProps> {
-  const list = await client.listScripts();
+  let list = await client.listScripts();
   let ours = list.find((s) => s.name === VACATION_NAME);
   if (!ours) {
     const legacy = list.find((s) => s.name === LEGACY_SCRIPT_NAME);
@@ -110,6 +110,7 @@ export async function readVacation(client: SieveClient): Promise<VacationProps> 
     // so it is wired into the wrapper from now on.
     try {
       await client.renameScript(LEGACY_SCRIPT_NAME, VACATION_NAME);
+      list = await client.listScripts();
       ours = { name: VACATION_NAME, active: legacy.active };
     } catch (e) {
       if (isNonexistent(e)) return { ...EMPTY };
@@ -125,18 +126,10 @@ export async function readVacation(client: SieveClient): Promise<VacationProps> 
     return { ...EMPTY, isEnabled: ours.active };
   }
   // Enabled means the action is in the script *and* the script runs: either
-  // it is the active script itself, or the active wrapper includes it. A
+  // it is the active script itself, or the active master includes it. A
   // user who activated another script from a different client has, in
   // effect, switched the responder off.
-  let running = ours.active;
-  const active = list.find((s) => s.active);
-  if (!running && active?.name === WRAPPER_NAME) {
-    try {
-      running = parseWrapper(await client.getScript(WRAPPER_NAME)).includes(VACATION_NAME);
-    } catch {
-      running = false;
-    }
-  }
+  const running = await vacationIsWired(client, list);
   return {
     isEnabled: running && scriptIsEnabled(body),
     subject: readMarker(body, "subject"),

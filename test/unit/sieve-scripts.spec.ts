@@ -6,7 +6,7 @@
 import net from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { SieveClient } from "../../src/sieve/client.js";
-import { WRAPPER_NAME, buildWrapper, listScriptsView, parseWrapper } from "../../src/sieve/manager.js";
+import { WRAPPER_NAME, buildWrapper, listScriptsView, parseWrapper, retargetMaster } from "../../src/sieve/manager.js";
 import { readVacation, writeVacation } from "../../src/sieve/vacation.js";
 import { sieveScriptGet, sieveScriptSet, sieveScriptValidate, scriptId, type SieveCtx } from "../../src/jmap/methods/sieve.js";
 import { vacationGet, vacationSet } from "../../src/jmap/methods/vacation.js";
@@ -324,6 +324,67 @@ describe("foreign script named like the wrapper", () => {
     const after = await sieveScriptGet({ accountId: "7" }, ctx);
     expect(after.list.map((s) => [s.name, s.isActive])).toEqual(expect.arrayContaining([["bulwark-1", true], ["vacation", false]]));
     expect(after.list.some((s) => s.name === WRAPPER_NAME)).toBe(false);
+  });
+});
+
+describe("existing include-based master script (Roundcube migration)", () => {
+  const MASTER = 'require ["include", "fileinto"];\r\n# site defaults\r\nif header :contains "X-Spam-Flag" "YES" { fileinto "Junk"; }\r\ninclude :global "corporate";\r\ninclude :personal "roundcube";\r\n';
+  const ROUNDCUBE = 'require ["fileinto"];\r\n# rule:[Lists]\r\nif header :contains "list-id" "x" { fileinto "Lists"; }\r\n';
+
+  beforeEach(() => {
+    fake.scripts.set("default", MASTER);
+    fake.scripts.set("roundcube", ROUNDCUBE);
+    fake.active = "default";
+  });
+
+  it("shows the included script as active and hides the master", async () => {
+    const g = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(g.list.map((x) => [x.name, x.isActive])).toEqual([["roundcube", true]]);
+  });
+
+  it("adds only a tagged vacation include to the master when the responder is set", async () => {
+    await vacationSet({ accountId: "7", update: { singleton: { isEnabled: true, textBody: "away" } } }, ctx);
+    expect(fake.active).toBe("default");
+    expect(fake.scripts.has(WRAPPER_NAME)).toBe(false);
+    const master = fake.scripts.get("default")!;
+    expect(master.startsWith(MASTER.trimEnd())).toBe(true);
+    expect(master.trimEnd().split("\r\n").pop()).toBe('include :personal :optional "vacation"; # legacy-proxy');
+    expect((await vacationGet({ accountId: "7" }, ctx)).list[0]).toMatchObject({ isEnabled: true });
+  });
+
+  it("switches the user script by commenting the old include out and tagging the new one", async () => {
+    const blobId = upload('require ["fileinto"];\nif header :contains "subject" "x" { fileinto "X"; }');
+    const r = await sieveScriptSet({ accountId: "7", create: { s: { name: "filters", blobId } }, onSuccessActivateScript: "#s" }, ctx);
+    expect(r.notCreated).toBeNull();
+    const master = fake.scripts.get("default")!;
+    expect(master).toContain('# legacy-proxy disabled: include :personal "roundcube";');
+    expect(master).toContain('include :personal "filters"; # legacy-proxy');
+    expect(master).toContain('include :global "corporate";');
+    expect(master).toContain('fileinto "Junk"');
+    expect(fake.active).toBe("default");
+    const g = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(g.list.map((x) => [x.name, x.isActive]).sort()).toEqual([["filters", true], ["roundcube", false], ["vacation", false]].sort().filter((e) => fake.scripts.has(e[0] as string)));
+
+    // Back to roundcube: our line goes, theirs is restored verbatim.
+    await sieveScriptSet({ accountId: "7", onSuccessActivateScript: scriptId("roundcube") }, ctx);
+    const back = fake.scripts.get("default")!;
+    expect(back).toContain('include :personal "roundcube";\r\n');
+    expect(back).not.toContain("disabled");
+    expect(back).not.toContain('"filters"');
+  });
+
+  it("refuses to update or destroy the master through JMAP", async () => {
+    const d = await sieveScriptSet({ accountId: "7", destroy: [scriptId("default")] }, ctx);
+    expect(d.notDestroyed?.[scriptId("default")]).toMatchObject({ type: "notFound" });
+    expect(fake.scripts.has("default")).toBe(true);
+  });
+});
+
+describe("retargetMaster", () => {
+  it("adds a require when the master lacks one and keeps line endings", () => {
+    const out = retargetMaster('include :personal "a";\n', "b");
+    expect(out).toBe('require ["include"];\n# legacy-proxy disabled: include :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\ninclude :personal "b"; # legacy-proxy\n');
+    expect(retargetMaster(out, null)).toBe('require ["include"];\n# legacy-proxy disabled: include :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n');
   });
 });
 
