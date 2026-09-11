@@ -9,7 +9,7 @@
 // autoresponder can both run on a single-active-script server.
 
 import type { SieveClient } from "./client.js";
-import { VACATION_NAME, ensureVacationWired, isNonexistent } from "./manager.js";
+import { VACATION_NAME, WRAPPER_NAME, ensureVacationWired, isNonexistent, parseWrapper } from "./manager.js";
 
 export interface VacationProps {
   isEnabled: boolean;
@@ -124,8 +124,21 @@ export async function readVacation(client: SieveClient): Promise<VacationProps> 
     // autoresponder so /get doesn't error out.
     return { ...EMPTY, isEnabled: ours.active };
   }
+  // Enabled means the action is in the script *and* the script runs: either
+  // it is the active script itself, or the active wrapper includes it. A
+  // user who activated another script from a different client has, in
+  // effect, switched the responder off.
+  let running = ours.active;
+  const active = list.find((s) => s.active);
+  if (!running && active?.name === WRAPPER_NAME) {
+    try {
+      running = parseWrapper(await client.getScript(WRAPPER_NAME)).includes(VACATION_NAME);
+    } catch {
+      running = false;
+    }
+  }
   return {
-    isEnabled: scriptIsEnabled(body),
+    isEnabled: running && scriptIsEnabled(body),
     subject: readMarker(body, "subject"),
     textBody: readMarker(body, "text"),
     htmlBody: readMarker(body, "html"),

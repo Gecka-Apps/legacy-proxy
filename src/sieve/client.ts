@@ -18,7 +18,11 @@ interface SieveOpts {
   secure?: boolean;
   creds: Credentials;
   servername?: string;
+  /** Connect / idle timeout; a stuck server must not pin a JMAP request. */
+  timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 export interface SieveScriptInfo {
   name: string;
@@ -64,15 +68,18 @@ export function humanText(response: string): string {
 export class SieveClient {
   private sock!: Socket | TLSSocket;
   private buf = Buffer.alloc(0);
-  private pending: (() => void) | null = null;
+  private pending: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private capabilities = new Map<string, string>();
   private opts: SieveOpts;
+  /** Set once the socket is gone; every later wait fails immediately. */
+  private dead: Error | null = null;
 
   constructor(opts: SieveOpts) {
     this.opts = opts;
   }
 
   async connect(): Promise<void> {
+    const timeout = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     await new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
       this.sock = this.opts.secure
@@ -85,6 +92,10 @@ export class SieveClient {
             resolve();
           });
       this.sock.on("error", onErr);
+      this.sock.setTimeout(timeout, () => {
+        this.fail(new Error(`ManageSieve ${this.opts.host}:${this.opts.port}: timed out after ${timeout}ms`));
+        reject(this.dead!);
+      });
       this.attachReader();
     });
     await this.readGreeting();
@@ -110,18 +121,33 @@ export class SieveClient {
   private attachReader(): void {
     this.sock.on("data", (chunk: Buffer) => {
       this.buf = Buffer.concat([this.buf, chunk]);
-      const cb = this.pending;
-      if (cb) {
+      const waiter = this.pending;
+      if (waiter) {
         this.pending = null;
-        cb();
+        waiter.resolve();
       }
     });
+    // Whatever ends the socket — the server hanging up, a network error, the
+    // idle timeout set in connect() — must wake a reader that is waiting for
+    // bytes, otherwise the JMAP call it serves never completes.
+    this.sock.on("error", (e: Error) => this.fail(e));
+    this.sock.on("close", () => this.fail(new Error(`ManageSieve ${this.opts.host}: connection closed`)));
   }
 
-  /** Resolve as soon as more bytes are available. */
+  private fail(e: Error): void {
+    if (this.dead) return;
+    this.dead = e;
+    const waiter = this.pending;
+    this.pending = null;
+    waiter?.reject(e);
+    this.sock.destroy();
+  }
+
+  /** Resolve as soon as more bytes are available; reject once the socket is gone. */
   private waitForData(): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.pending = resolve;
+    if (this.dead) return Promise.reject(this.dead);
+    return new Promise<void>((resolve, reject) => {
+      this.pending = { resolve, reject };
     });
   }
 
@@ -282,11 +308,14 @@ export class SieveClient {
   }
 
   async logout(): Promise<void> {
+    if (this.dead) return;
     try {
       this.sock.write("LOGOUT\r\n");
     } catch {
       /* socket already gone */
     }
+    // Our own hang-up is not a failure a pending reader should hear about.
+    this.dead = new Error("ManageSieve: logged out");
     this.sock.destroy();
   }
 }

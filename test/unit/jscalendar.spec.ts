@@ -147,6 +147,31 @@ describe("JSCalendar → iCalendar", () => {
     expect(out).not.toContain("VTIMEZONE");
   });
 
+  it("defaults an override's DTSTART to its recurrence id and omits a redundant start on read", () => {
+    const out = serializeEvent({
+      uid: "r",
+      title: "Weekly",
+      start: "2025-06-02T09:00:00",
+      duration: "PT1H",
+      timeZone: "Europe/Paris",
+      recurrenceRules: [{ frequency: "weekly" }],
+      recurrenceOverrides: { "2025-06-09T09:00:00": { title: "Renamed only" } },
+    });
+    const override = out.slice(out.lastIndexOf("BEGIN:VEVENT"));
+    expect(override).toContain("DTSTART;TZID=Europe/Paris:20250609T090000");
+    expect(override).toContain("RECURRENCE-ID;TZID=Europe/Paris:20250609T090000");
+    expect(parseICalendar(out).events[0]!.recurrenceOverrides).toEqual({ "2025-06-09T09:00:00": { title: "Renamed only" } });
+  });
+
+  it("writes UNTIL as a DATE for all-day series and lets a singular recurrenceRule win over a stale plural", () => {
+    const allDay = serializeEvent({ uid: "a", start: "2025-06-02T00:00:00", duration: "P1D", showWithoutTime: true, timeZone: null, recurrenceRules: [{ frequency: "daily", until: "2025-06-10T23:59:59" }] });
+    expect(allDay).toContain("RRULE:FREQ=DAILY;UNTIL=20250610\r\n");
+    const patched = serializeEvent({ uid: "s", start: "2025-06-02T09:00:00", duration: "PT1H", timeZone: null, recurrenceRules: [{ frequency: "weekly" }], recurrenceRule: { frequency: "daily" } });
+    expect(patched).toContain("RRULE:FREQ=DAILY\r\n");
+    const cleared = serializeEvent({ uid: "s", start: "2025-06-02T09:00:00", duration: "PT1H", timeZone: null, recurrenceRules: [{ frequency: "weekly" }], recurrenceRule: null });
+    expect(cleared).not.toContain("RRULE");
+  });
+
   it("writes a floating event without TZID and a UTC one with Z", () => {
     const floating = serializeEvent({ uid: "f", start: "2025-01-01T09:00:00", duration: "PT1H", timeZone: null });
     expect(floating).toContain("DTSTART:20250101T090000\r\n");

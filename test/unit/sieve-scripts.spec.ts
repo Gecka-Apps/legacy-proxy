@@ -269,6 +269,47 @@ describe("SieveScript/set", () => {
   });
 });
 
+describe("ManageSieve client failure modes", () => {
+  it("rejects instead of hanging when the server goes silent", async () => {
+    const silent = net.createServer(() => {
+      /* accept and never speak */
+    });
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", () => r()));
+    const port = (silent.address() as net.AddressInfo).port;
+    const c = new SieveClient({ host: "127.0.0.1", port, creds, timeoutMs: 200 });
+    await expect(c.connect()).rejects.toThrow(/timed out/);
+    silent.close();
+  });
+
+  it("rejects a pending read when the server hangs up mid-command", async () => {
+    const rude = net.createServer((sock) => {
+      sock.write('"IMPLEMENTATION" "Rude"\r\nOK\r\n');
+      sock.on("data", () => sock.destroy());
+    });
+    await new Promise<void>((r) => rude.listen(0, "127.0.0.1", () => r()));
+    const port = (rude.address() as net.AddressInfo).port;
+    const c = new SieveClient({ host: "127.0.0.1", port, creds });
+    await expect(c.connect()).rejects.toThrow(/closed/);
+    rude.close();
+  });
+});
+
+describe("vacation state", () => {
+  it("reports the responder off when another script holds the active slot", async () => {
+    fake.scripts.set("vacation", 'require ["vacation"];\n# bulwark-vacation: enabled\nvacation :days 1 "x";');
+    fake.scripts.set("handmade", "keep;");
+    fake.active = "handmade";
+    const c = await client();
+    expect((await readVacation(c)).isEnabled).toBe(false);
+    // Re-enabling through the proxy wires the wrapper and carries the user's script along.
+    await writeVacation(c, { isEnabled: true, textBody: "x" });
+    expect(fake.active).toBe(WRAPPER_NAME);
+    expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "handmade"]);
+    expect((await readVacation(c)).isEnabled).toBe(true);
+    await c.logout();
+  });
+});
+
 describe("vacation migration", () => {
   it("renames the legacy bulwark-vacation script and reads its state from the body", async () => {
     fake.scripts.set("bulwark-vacation", 'require ["vacation"];\n# bulwark-vacation: enabled\n# bulwark.subject=' + Buffer.from("Hi").toString("base64") + '\nvacation :days 1 "x";');
