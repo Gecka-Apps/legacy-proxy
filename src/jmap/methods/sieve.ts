@@ -25,6 +25,7 @@ import {
   activeUserScript,
   isNonexistent,
   projectScripts,
+  wrapperOwnedByUs,
 } from "../../sieve/manager.js";
 import { changesOrCannotCalculate, type ChangesResponse } from "./_shared.js";
 import { log } from "../../util/log.js";
@@ -110,7 +111,7 @@ export async function fetchScriptBody(ctx: SieveCtx, name: string): Promise<stri
 async function listProjected(c: SieveClient): Promise<SieveScriptJson[]> {
   const raw = await c.listScripts();
   const active = await activeUserScript(c, raw);
-  const view = projectScripts(raw, active);
+  const view = projectScripts(raw, active, await wrapperOwnedByUs(c, raw));
   const out: SieveScriptJson[] = [];
   for (const s of view) {
     let body = "";
@@ -232,7 +233,8 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
   await withClient(ctx, async (c) => {
     let raw = await c.listScripts();
     let active = await activeUserScript(c, raw);
-    const known = () => new Set(raw.filter((s) => s.name !== WRAPPER_NAME).map((s) => s.name));
+    const wrapperIsOurs = await wrapperOwnedByUs(c, raw);
+    const known = () => new Set(raw.filter((s) => !(wrapperIsOurs && s.name === WRAPPER_NAME)).map((s) => s.name));
 
     // -- create
     for (const [tempId, spec] of Object.entries(args.create ?? {})) {

@@ -72,13 +72,23 @@ function escapeString(s: string): string {
  */
 export async function listScriptsView(client: SieveClient): Promise<ScriptView[]> {
   const raw = await client.listScripts();
-  return projectScripts(raw, await activeUserScript(client, raw));
+  return projectScripts(raw, await activeUserScript(client, raw), await wrapperOwnedByUs(client, raw));
 }
 
-export function projectScripts(raw: SieveScriptInfo[], activeUser: string | null): ScriptView[] {
+/**
+ * `hideWrapper` is false when a script named like the wrapper is really the
+ * user's (see rescueForeignWrapper); it then stays visible.
+ */
+export function projectScripts(raw: SieveScriptInfo[], activeUser: string | null, hideWrapper = true): ScriptView[] {
   return raw
-    .filter((s) => s.name !== WRAPPER_NAME)
+    .filter((s) => !(hideWrapper && s.name === WRAPPER_NAME))
     .map((s) => ({ name: s.name, isActive: s.name === activeUser }));
+}
+
+/** True when no script wears the wrapper's name, or the one that does is ours. */
+export async function wrapperOwnedByUs(client: SieveClient, raw: SieveScriptInfo[]): Promise<boolean> {
+  if (!raw.some((s) => s.name === WRAPPER_NAME)) return true;
+  return isOurWrapper(client);
 }
 
 /**
@@ -91,8 +101,10 @@ export async function activeUserScript(client: SieveClient, raw?: SieveScriptInf
   const active = list.find((s) => s.active);
   if (!active) return null;
   if (active.name === WRAPPER_NAME) {
-    const included = parseWrapper(await client.getScript(WRAPPER_NAME));
-    return included.find((n) => n !== VACATION_NAME) ?? null;
+    const body = await client.getScript(WRAPPER_NAME);
+    // Not ours (yet): a user script that happens to wear the name.
+    if (!body.startsWith(WRAPPER_HEADER)) return active.name;
+    return parseWrapper(body).find((n) => n !== VACATION_NAME) ?? null;
   }
   return active.name === VACATION_NAME ? null : active.name;
 }
@@ -104,11 +116,39 @@ export async function activeUserScript(client: SieveClient, raw?: SieveScriptInf
  */
 export async function activateUserScript(client: SieveClient, name: string | null): Promise<void> {
   if (supportsInclude(client)) {
-    await client.putScript(WRAPPER_NAME, buildWrapper(name));
+    const displaced = await rescueForeignWrapper(client);
+    // The user's own script wore our name: it keeps being the active one,
+    // under its new name, unless the caller asked for something else.
+    const target = name === WRAPPER_NAME ? displaced ?? null : name;
+    await client.putScript(WRAPPER_NAME, buildWrapper(target));
     await client.setActive(WRAPPER_NAME);
     return;
   }
   await client.setActive(name ?? "");
+}
+
+/**
+ * A script named like the wrapper that we did not write (a user who picked
+ * "bulwark" as a name before the proxy existed) must not be overwritten.
+ * Rename it to the first free `bulwark-N` and return the new name.
+ */
+async function rescueForeignWrapper(client: SieveClient): Promise<string | null> {
+  const list = await client.listScripts();
+  if (!list.some((s) => s.name === WRAPPER_NAME)) return null;
+  let body: string;
+  try {
+    body = await client.getScript(WRAPPER_NAME);
+  } catch (e) {
+    if (isNonexistent(e)) return null;
+    throw e;
+  }
+  if (body.startsWith(WRAPPER_HEADER)) return null;
+  const taken = new Set(list.map((s) => s.name));
+  let n = 1;
+  while (taken.has(`${WRAPPER_NAME}-${n}`)) n++;
+  const fresh = `${WRAPPER_NAME}-${n}`;
+  await client.renameScript(WRAPPER_NAME, fresh);
+  return fresh;
 }
 
 /**
@@ -123,7 +163,7 @@ export async function ensureVacationWired(client: SieveClient, enabled: boolean)
   const raw = await client.listScripts();
   const active = raw.find((s) => s.active);
   if (supportsInclude(client)) {
-    if (active?.name === WRAPPER_NAME) return;
+    if (active?.name === WRAPPER_NAME && (await isOurWrapper(client))) return;
     const carried = active && active.name !== VACATION_NAME ? active.name : null;
     await activateUserScript(client, carried);
     return;
@@ -132,6 +172,14 @@ export async function ensureVacationWired(client: SieveClient, enabled: boolean)
     await client.setActive(VACATION_NAME);
   } else if (active?.name === VACATION_NAME) {
     await client.setActive("");
+  }
+}
+
+async function isOurWrapper(client: SieveClient): Promise<boolean> {
+  try {
+    return (await client.getScript(WRAPPER_NAME)).startsWith(WRAPPER_HEADER);
+  } catch {
+    return false;
   }
 }
 

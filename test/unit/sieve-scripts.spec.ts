@@ -310,6 +310,23 @@ describe("vacation state", () => {
   });
 });
 
+describe("foreign script named like the wrapper", () => {
+  it("stays visible, is renamed out of the way on activation, and keeps running", async () => {
+    fake.scripts.set(WRAPPER_NAME, 'require ["fileinto"];\nfileinto "Old";');
+    fake.active = WRAPPER_NAME;
+    const g = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(g.list).toEqual([expect.objectContaining({ name: WRAPPER_NAME, isActive: true })]);
+
+    await vacationSet({ accountId: "7", update: { singleton: { isEnabled: true, textBody: "away" } } }, ctx);
+    expect(fake.scripts.get(WRAPPER_NAME)).toMatch(/^# Managed by legacy-proxy/);
+    expect(fake.scripts.get("bulwark-1")).toContain('fileinto "Old"');
+    expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "bulwark-1"]);
+    const after = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(after.list.map((s) => [s.name, s.isActive])).toEqual(expect.arrayContaining([["bulwark-1", true], ["vacation", false]]));
+    expect(after.list.some((s) => s.name === WRAPPER_NAME)).toBe(false);
+  });
+});
+
 describe("vacation migration", () => {
   it("renames the legacy bulwark-vacation script and reads its state from the body", async () => {
     fake.scripts.set("bulwark-vacation", 'require ["vacation"];\n# bulwark-vacation: enabled\n# bulwark.subject=' + Buffer.from("Hi").toString("base64") + '\nvacation :days 1 "x";');
