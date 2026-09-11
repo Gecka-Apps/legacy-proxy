@@ -498,12 +498,20 @@ export class CardDavClient {
     }
   }
 
+  /**
+   * Forward an arbitrary DAV request from a client (the webmail's /dav
+   * proxy path) to the server and hand the raw response back.
+   */
+  async proxy(method: string, href: string, body: Buffer | null, headers: Record<string, string>): Promise<Response> {
+    return this.raw(method, href, body, headers);
+  }
+
   // -- low-level ----------------------------------------------------------
 
   private async raw(
     method: string,
     path: string,
-    body: string | null,
+    body: string | Buffer | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
     let url = absolutise(this.origin, path);
@@ -522,7 +530,7 @@ export class CardDavClient {
       const res = await fetchInTime(url, {
         method,
         headers: { Authorization: this.authHeader, ...headers },
-        ...(body === null ? {} : { body }),
+        ...(body === null ? {} : { body: body as BodyInit }),
         redirect: "manual",
         signal,
       });
@@ -631,7 +639,7 @@ async function httpError(method: string, path: string, res: Response): Promise<E
 // XML helpers (deliberately small, namespace-aware on local name only).
 // -----------------------------------------------------------------------
 
-function buildAuth(c: Credentials): string {
+export function buildAuth(c: Credentials): string {
   if (c.mech === "PLAIN" && c.password) {
     const b64 = Buffer.from(`${c.username}:${c.password}`).toString("base64");
     return `Basic ${b64}`;
@@ -653,7 +661,7 @@ function buildAuth(c: Credentials): string {
  * when it has the same scheme, host and port and no user name; anything else
  * throws, so no request is sent.
  */
-function absolutise(origin: string, pathOrUrl: string): string {
+export function absolutise(origin: string, pathOrUrl: string): string {
   const raw = /^[a-z][a-z0-9+.-]*:/i.test(pathOrUrl)
     ? pathOrUrl
     : origin + (pathOrUrl.startsWith("/") ? "" : "/") + pathOrUrl;
@@ -707,13 +715,13 @@ function isDotSegment(p: string): boolean {
 // encoder writes and some servers decode to a dot or a slash.
 const OVERLONG_UTF8 = /%(?:c0|c1)|%e0%[89][0-9a-f]|%f0%8[0-9a-f]/i;
 
-function leafName(href: string): string {
+export function leafName(href: string): string {
   const trimmed = href.replace(/\/+$/, "");
   const idx = trimmed.lastIndexOf("/");
   return decodeURIComponent(idx >= 0 ? trimmed.slice(idx + 1) : trimmed);
 }
 
-function escapeXml(s: string): string {
+export function escapeXml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -822,7 +830,7 @@ const NAMED_ENTITIES: Record<string, string> = { lt: "<", gt: ">", quot: '"', ap
  * character reference that names no XML character (beyond U+10FFFF, a
  * surrogate, U+0000) stays as written.
  */
-function decodeXmlText(s: string): string {
+export function decodeXmlText(s: string): string {
   return s.replace(
     /<!\[CDATA\[([\s\S]*?)\]\]>|&(lt|gt|quot|apos|amp|#x[0-9a-fA-F]+|#[0-9]+);/g,
     (m, cdata: string | undefined, ref: string) => {

@@ -251,6 +251,17 @@ CREATE TABLE IF NOT EXISTS push_subscription (
 );
 CREATE INDEX IF NOT EXISTS push_sub_account_idx ON push_subscription(account_id);
 
+-- Client-side preferences the DAV backends cannot hold (a calendar's
+-- isVisible / sortOrder, the default participant identity, ...). One JSON
+-- document per (account, key); the key namespaces the object it belongs to.
+CREATE TABLE IF NOT EXISTS pref (
+  account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  key        TEXT    NOT NULL,
+  value      TEXT    NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, key)
+);
+
 -- Session tokens their holder ended with /api/logout, by SHA-256 of the token,
 -- kept until the token would have expired anyway.
 CREATE TABLE IF NOT EXISTS ended_session (
@@ -450,6 +461,29 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  /** JSON preference document for (account, key), or null. */
+  getPref<T>(accountId: number, key: string): T | null {
+    const row = this.prep(`SELECT value FROM pref WHERE account_id = ? AND key = ?`)
+      .get(accountId, key) as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  setPref(accountId: number, key: string, value: unknown): void {
+    this.prep(
+      `INSERT INTO pref(account_id, key, value, updated_at) VALUES(?,?,?,?)
+       ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(accountId, key, JSON.stringify(value), Date.now());
+  }
+
+  deletePref(accountId: number, key: string): void {
+    this.prep(`DELETE FROM pref WHERE account_id = ? AND key = ?`).run(accountId, key);
   }
 
   /** Keep the provider discovered for `domain` (JSON) after a login it served succeeded. */

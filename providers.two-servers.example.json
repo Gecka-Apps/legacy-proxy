@@ -5,6 +5,7 @@
     "smtp":    { "host": "smtp.mailbox.org",  "port": 465,  "secure": true },
     "sieve":   { "host": "imap.mailbox.org",  "port": 4190, "starttls": true },
     "carddav": { "host": "dav.mailbox.org",   "port": 443,  "secure": true, "basePath": "/.well-known/carddav" },
+    "caldav":  { "host": "dav.mailbox.org",   "port": 443,  "secure": true, "basePath": "/.well-known/caldav" },
     "auth":    { "mech": ["PLAIN", "LOGIN"] }
   },
   "posteo": {

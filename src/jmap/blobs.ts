@@ -1,6 +1,6 @@
-// Read a blob's bytes for building a message: uploads from SQLite, mail parts
-// from the blob cache or else an IMAP fetch - the lookup the download route
-// does, buffered instead of streamed.
+// Read a blob's bytes for building a message or parsing an attachment:
+// uploads from SQLite, mail parts from the blob cache or else an IMAP fetch -
+// the lookup the download route does, buffered instead of streamed.
 
 import type { ImapFlow } from "imapflow";
 import { Buffer } from "node:buffer";
@@ -9,9 +9,13 @@ import type { ImapPool } from "../imap/pool.js";
 import { decodeBlobId, decodeEmailId } from "../mapping/ids.js";
 import type { AccountRow, Store } from "../state/store.js";
 
+/** Upper bound for a read whose result is parsed in memory; anything larger is treated as absent. */
+export const MAX_BUFFERED_BLOB = 8 * 1024 * 1024;
+
 export async function readBlob(
   blobId: string,
-  ctx: { account: AccountRow; store: Store; client: ImapFlow; pool?: ImapPool },
+  ctx: { account: AccountRow; store: Store; client?: ImapFlow; pool?: ImapPool },
+  maxBytes: number = Number.POSITIVE_INFINITY,
 ): Promise<{ body: Buffer; ctype: string } | null> {
   if (blobId.startsWith("U")) return ctx.store.getUpload(blobId, ctx.account.id);
   const cached = ctx.store.getCachedBlob(blobId, ctx.account.id);
@@ -36,14 +40,21 @@ export async function readBlob(
       // imapflow answers `{}` rather than null for an expunged message or part.
       if (!dl?.content) return null;
       const chunks: Buffer[] = [];
+      let size = 0;
       try {
-        for await (const chunk of dl.content) chunks.push(chunk as Buffer);
+        // Past maxBytes the rest is read and dropped: leaving the literal
+        // half-read would spoil the connection as a broken FETCH does.
+        for await (const chunk of dl.content) {
+          size += (chunk as Buffer).length;
+          if (size <= maxBytes) chunks.push(chunk as Buffer);
+        }
       } catch (e) {
         // A FETCH that broke off mid-literal leaves the connection
         // unparseable, so drop it rather than pool it.
         client.close();
         throw e;
       }
+      if (size > maxBytes) return null;
       return {
         body: Buffer.concat(chunks),
         ctype: part.partId ? dl.meta?.contentType ?? "application/octet-stream" : "message/rfc822",
@@ -51,5 +62,6 @@ export async function readBlob(
     });
   // Like the download route, fetch on the bulk connection so a large
   // forwarded attachment doesn't hold up the account's interactive calls.
-  return ctx.pool ? ctx.pool.withConnection(ctx.account, "bulk", fetch) : fetch(ctx.client);
+  if (ctx.pool) return ctx.pool.withConnection(ctx.account, "bulk", fetch);
+  return ctx.client ? fetch(ctx.client) : null;
 }

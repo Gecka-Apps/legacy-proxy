@@ -38,10 +38,35 @@ describe("capability allowlist", () => {
   // carddav backend was configured, but /jmap rejected any request `using`
   // it with 400 unknownCapability, so nothing ever reached the DAV server.
   it("accepts every capability the session can advertise", () => {
-    const session = buildSession(cfg, account, providerWithContacts);
+    const everything: ProviderConfig = {
+      ...providerWithContacts,
+      sieve: { host: "imap.x.io", port: 4190, starttls: true },
+      caldav: { host: "radicale.x.io", port: 443, secure: true, basePath: "/" },
+    };
+    const session = buildSession(cfg, account, everything);
     for (const cap of Object.keys(session.capabilities)) {
       expect(KNOWN_CAPABILITIES.has(cap), `KNOWN_CAPABILITIES is missing ${cap}`).toBe(true);
     }
+    expect(Object.keys(session.capabilities)).toEqual(
+      expect.arrayContaining(["urn:ietf:params:jmap:sieve", "urn:ietf:params:jmap:calendars", "urn:ietf:params:jmap:contacts"]),
+    );
+  });
+
+  it("advertises RFC 9661 sieve and calendars only when their backends are configured", () => {
+    const bare = buildSession(cfg, account, providerWithContacts);
+    expect(Object.keys(bare.capabilities)).not.toContain("urn:ietf:params:jmap:sieve");
+    expect(Object.keys(bare.capabilities)).not.toContain("urn:ietf:params:jmap:calendars");
+
+    const full = buildSession(
+      cfg,
+      account,
+      { ...providerWithContacts, sieve: { host: "imap.x.io", port: 4190 }, caldav: { host: "radicale.x.io", port: 443 } },
+      { sieve: { implementation: "Dovecot Pigeonhole", extensions: ["fileinto", "include"], notify: [], maxRedirects: 4 } },
+    );
+    const acct = full.accounts["1"]!.accountCapabilities as Record<string, Record<string, unknown>>;
+    expect(acct["urn:ietf:params:jmap:sieve"]).toMatchObject({ implementation: "Dovecot Pigeonhole", sieveExtensions: ["fileinto", "include"], maxNumberRedirects: 4 });
+    expect(full.primaryAccounts["urn:ietf:params:jmap:calendars"]).toBe("1");
+    expect(full.primaryAccounts["urn:ietf:params:jmap:sieve"]).toBe("1");
   });
 
   it("advertises contacts only when carddav is configured", () => {

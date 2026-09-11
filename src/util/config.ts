@@ -35,6 +35,18 @@ export interface ProviderConfig {
     password?: string;
     forUser?: string;
   } | null;
+  /**
+   * CalDAV server backing JMAP for Calendars. Same shape as `carddav`; the
+   * two usually point at the same host (Radicale, Baïkal, SOGo…). Absent or
+   * null disables the calendars capability.
+   */
+  caldav?: {
+    host: string;
+    port: number;
+    secure?: boolean;
+    basePath?: string;
+    principalPath?: string;
+  } | null;
   auth: { mech: string[] };
   /**
    * Set on a provider found by discovery (auth/discovery.ts), never in

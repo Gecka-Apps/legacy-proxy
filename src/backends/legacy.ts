@@ -40,6 +40,21 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "../jmap/methods/contacts.js";
+import {
+  calendarChanges,
+  calendarEventChanges,
+  calendarEventGet,
+  calendarEventParse,
+  calendarEventQuery,
+  calendarEventQueryChanges,
+  calendarEventSet,
+  calendarGet,
+  calendarSet,
+  calendarsAvailable,
+  participantIdentityGet,
+  participantIdentitySet,
+} from "../jmap/methods/calendar.js";
+import { sieveScriptChanges, sieveScriptGet, sieveScriptSet, sieveScriptValidate } from "../jmap/methods/sieve.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -244,7 +259,81 @@ function makeMethodTable(): Record<string, Handler> {
     },
     "VacationResponse/changes": async (a, c) =>
       vacationChanges(a as never, { account: c.account, store: c.store }),
+    "SieveScript/get": async (a, c) => sieveScriptGet(a as never, await sieveCtx(c)),
+    "SieveScript/set": async (a, c) => sieveScriptSet(a as never, await sieveCtx(c)),
+    "SieveScript/validate": async (a, c) => sieveScriptValidate(a as never, await sieveCtx(c)),
+    "SieveScript/changes": async (a, c) => sieveScriptChanges(a as never, { account: c.account, store: c.store }),
+    "Calendar/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyGet(a, c);
+      return calendarGet(a as never, await calendarCtx(c, provider));
+    },
+    "Calendar/set": async (a, c) => calendarSet(a as never, await calendarCtx(c)),
+    "Calendar/changes": async (a, c) => calendarChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyGet(a, c);
+      return calendarEventGet(a as never, await calendarCtx(c, provider));
+    },
+    "CalendarEvent/query": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) return emptyQuery(a, c);
+      return calendarEventQuery(a as never, await calendarCtx(c, provider));
+    },
+    "CalendarEvent/set": async (a, c) => calendarEventSet(a as never, await calendarCtx(c)),
+    "CalendarEvent/changes": async (a, c) => calendarEventChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/queryChanges": async (a, c) => calendarEventQueryChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/parse": async (a, c) => calendarEventParse(a as never, await calendarCtx(c)),
+    "ParticipantIdentity/get": async (a, c) => participantIdentityGet(a as never, { account: c.account, store: c.store }),
+    "ParticipantIdentity/set": async (a, c) => participantIdentitySet(a as never, { account: c.account, store: c.store }),
+    // Scheduling inbox notifications need server-side iTIP processing, which
+    // a CalDAV store without scheduling support (Radicale) cannot provide.
+    // Empty answers let a client that always asks (Bulwark) carry on.
+    "CalendarEventNotification/get": async (a, c) => emptyGet(a, c),
+    "CalendarEventNotification/query": async (a, c) => emptyQuery(a, c),
+    "CalendarEventNotification/set": async (a, c) => ({
+      accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+      oldState: "0",
+      newState: "0",
+      created: null,
+      updated: null,
+      destroyed: ((a as { destroy?: string[] | null }).destroy ?? []) as string[],
+      notCreated: null,
+      notUpdated: null,
+      notDestroyed: null,
+    }),
   };
+}
+
+function emptyGet(a: Record<string, unknown>, c: LegacyContext) {
+  return {
+    accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+    state: "0",
+    list: [],
+    notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+  };
+}
+
+function emptyQuery(a: Record<string, unknown>, c: LegacyContext) {
+  return {
+    accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+    queryState: "0",
+    canCalculateChanges: false,
+    position: 0,
+    total: 0,
+    ids: [],
+  };
+}
+
+async function sieveCtx(c: LegacyContext) {
+  const provider = resolveProvider(c.cfg, c.account.kind);
+  const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
+  return { account: c.account, provider, creds, store: c.store };
+}
+
+async function calendarCtx(c: LegacyContext, provider = resolveProvider(c.cfg, c.account.kind)) {
+  const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
+  return { account: c.account, provider, creds, store: c.store, pool: c.pool };
 }
 
 const TABLE = makeMethodTable();

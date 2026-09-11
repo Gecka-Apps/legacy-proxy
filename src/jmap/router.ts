@@ -129,6 +129,24 @@ const METHOD_CAPABILITY: Record<string, string> = {
   "VacationResponse/changes": "urn:ietf:params:jmap:vacationresponse",
   "PushSubscription/get": "urn:ietf:params:jmap:core",
   "PushSubscription/set": "urn:ietf:params:jmap:core",
+  "SieveScript/get": "urn:ietf:params:jmap:sieve",
+  "SieveScript/set": "urn:ietf:params:jmap:sieve",
+  "SieveScript/validate": "urn:ietf:params:jmap:sieve",
+  "SieveScript/changes": "urn:ietf:params:jmap:sieve",
+  "Calendar/get": "urn:ietf:params:jmap:calendars",
+  "Calendar/set": "urn:ietf:params:jmap:calendars",
+  "Calendar/changes": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/get": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/query": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/set": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/changes": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/queryChanges": "urn:ietf:params:jmap:calendars",
+  "CalendarEvent/parse": "urn:ietf:params:jmap:calendars",
+  "ParticipantIdentity/get": "urn:ietf:params:jmap:calendars",
+  "ParticipantIdentity/set": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/get": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/query": "urn:ietf:params:jmap:calendars",
+  "CalendarEventNotification/set": "urn:ietf:params:jmap:calendars",
 };
 // Methods that only read. A run of these, none of which references an earlier
 // call, can be executed together instead of one after another.
@@ -170,6 +188,18 @@ const PARALLEL_SAFE_METHODS = new Set([
   "ContactCard/changes",
   "ContactCard/queryChanges",
   "PushSubscription/get",
+  "SieveScript/get",
+  "SieveScript/changes",
+  "Calendar/get",
+  "Calendar/changes",
+  "CalendarEvent/get",
+  "CalendarEvent/query",
+  "CalendarEvent/changes",
+  "CalendarEvent/queryChanges",
+  "CalendarEvent/parse",
+  "ParticipantIdentity/get",
+  "CalendarEventNotification/get",
+  "CalendarEventNotification/query",
 ]);
 
 // Ceiling on how many calls from one envelope run at once. The interactive
