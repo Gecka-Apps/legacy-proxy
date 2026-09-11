@@ -235,7 +235,10 @@ export function parseICalendar(ics: string): ParsedCalendar {
         if (!rid || !ridVal) continue;
         const key = overrideKey(rid, ridVal, ev.timeZone, vtimezones);
         const full = eventFromComponent(o, uid, vtimezones);
-        map[key] = diffOverride(ev, full);
+        const patch = diffOverride(ev, full);
+        // An override starting at its own recurrence id carries no `start`.
+        if (patch.start === key) delete patch.start;
+        map[key] = patch;
       }
       ev.recurrenceOverrides = Object.keys(map).length ? map : null;
     }
@@ -633,7 +636,16 @@ export function serializeEvent(input: JsonObject, opts: SerializeOptions = {}): 
         if (tz && tz !== "Etc/UTC") p.setParameter("tzid", tz);
         continue;
       }
-      const merged: JsonObject = { ...ev, ...(patch as JsonObject), recurrenceOverrides: null, recurrenceRules: null, excludedRecurrenceRules: null };
+      // RFC 8984 §4.3.3: an override's `start` defaults to its recurrence id,
+      // not to the master's start.
+      const merged: JsonObject = {
+        ...ev,
+        start: key,
+        ...(patch as JsonObject),
+        recurrenceOverrides: null,
+        recurrenceRules: null,
+        excludedRecurrenceRules: null,
+      };
       const oc = componentFromEvent(merged, zones, null);
       const rid = oc.addPropertyWithValue("recurrence-id", makeTime(local, tz, Boolean(ev.showWithoutTime)));
       if (tz && tz !== "Etc/UTC") rid.setParameter("tzid", tz);
@@ -661,10 +673,13 @@ export function serializeEvent(input: JsonObject, opts: SerializeOptions = {}): 
 function normaliseInput(input: JsonObject): JsonObject {
   const ev: JsonObject = { ...input };
   delete ev["@type"];
-  if (ev.recurrenceRule !== undefined && ev.recurrenceRules === undefined) {
+  // The singular spelling only ever comes from a client (we emit the plural),
+  // so when both are present the singular is the newer value: a patch applied
+  // on top of a parsed event leaves the stale plural behind.
+  if (ev.recurrenceRule !== undefined) {
     ev.recurrenceRules = ev.recurrenceRule == null ? null : Array.isArray(ev.recurrenceRule) ? ev.recurrenceRule : [ev.recurrenceRule];
   }
-  if (ev.excludedRecurrenceRule !== undefined && ev.excludedRecurrenceRules === undefined) {
+  if (ev.excludedRecurrenceRule !== undefined) {
     ev.excludedRecurrenceRules = ev.excludedRecurrenceRule == null ? null : Array.isArray(ev.excludedRecurrenceRule) ? ev.excludedRecurrenceRule : [ev.excludedRecurrenceRule];
   }
   delete ev.recurrenceRule;
@@ -805,9 +820,9 @@ function componentFromEvent(ev: JsonObject, zones: Set<string>, original: ICAL.C
 
   // Recurrence
   const rules = ev.recurrenceRules as JsonObject[] | null | undefined;
-  for (const r of rules ?? []) c.addPropertyWithValue("rrule", recurFromJs(r, tz));
+  for (const r of rules ?? []) c.addPropertyWithValue("rrule", recurFromJs(r, tz, showWithoutTime));
   const exrules = ev.excludedRecurrenceRules as JsonObject[] | null | undefined;
-  for (const r of exrules ?? []) c.addPropertyWithValue("exrule", recurFromJs(r, tz));
+  for (const r of exrules ?? []) c.addPropertyWithValue("exrule", recurFromJs(r, tz, showWithoutTime));
 
   // Participants
   const participants = ev.participants as Record<string, ParticipantJson> | null | undefined;
@@ -904,14 +919,17 @@ function keysToUris(keys: Record<string, boolean> | undefined, all: Record<strin
 
 const DAY_REVERSE: Record<string, string> = { su: "SU", mo: "MO", tu: "TU", we: "WE", th: "TH", fr: "FR", sa: "SA" };
 
-function recurFromJs(r: JsonObject, tz: string | null): ICAL.Recur {
+function recurFromJs(r: JsonObject, tz: string | null, dateOnly = false): ICAL.Recur {
   const parts: string[] = [`FREQ=${String(r.frequency ?? "daily").toUpperCase()}`];
   if (typeof r.interval === "number" && r.interval > 1) parts.push(`INTERVAL=${r.interval}`);
   if (typeof r.count === "number") parts.push(`COUNT=${r.count}`);
   if (typeof r.until === "string") {
     const l = parseLocal(r.until);
     if (l) {
-      if (tz && tz !== "Etc/UTC") parts.push(`UNTIL=${toIcalUtc(localToUtc(tz, l))}`);
+      // RFC 5545 §3.3.10: UNTIL takes the DTSTART's value type — DATE for an
+      // all-day event, UTC when DTSTART is zoned, floating otherwise.
+      if (dateOnly) parts.push(`UNTIL=${toIcalLocal(l).slice(0, 8)}`);
+      else if (tz && tz !== "Etc/UTC") parts.push(`UNTIL=${toIcalUtc(localToUtc(tz, l))}`);
       else if (tz === "Etc/UTC") parts.push(`UNTIL=${toIcalLocal(l)}Z`);
       else parts.push(`UNTIL=${toIcalLocal(l)}`);
     }
