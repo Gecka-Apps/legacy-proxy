@@ -760,6 +760,7 @@ export async function emailGet(
 ): Promise<{ accountId: string; state: string; list: Record<string, unknown>[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const list: JmapEmail[] = [];
+  const found = new Map<string, JmapEmail>();
   const notFound: string[] = [];
   // If the client picked an explicit property set, skip the preview FETCH
   // unless `preview` was requested. This is the common path for header-only
@@ -782,7 +783,11 @@ export async function emailGet(
 
   // Group ids by mailbox so we can do one SELECT + one batched FETCH per
   // mailbox, instead of one per id. UI flows (open thread, open folder)
-  // typically request many ids in the same mailbox.
+  // typically request many ids in the same mailbox. The response is put
+  // back in the order of `ids` afterwards: RFC 8620 leaves it undefined,
+  // but clients feed Thread/get ids (oldest first) straight into Email/get
+  // and render the list as it comes, so a thread spread over two folders
+  // would otherwise show folder by folder.
   type Group = { mailboxIdx: number; entries: { id: string; uid: number }[] };
   const groups = new Map<number, Group>();
   for (const id of args.ids) {
@@ -837,9 +842,13 @@ export async function emailGet(
     });
     for (const e of group.entries) {
       const meta = fetched.get(e.uid);
-      if (meta) list.push(meta);
+      if (meta) found.set(e.id, meta);
       else notFound.push(e.id);
     }
+  }
+  for (const id of args.ids) {
+    const meta = found.get(id);
+    if (meta) list.push(meta);
   }
   const projected = list.map((e) => projectEmailForGet(e, args.properties));
   return {
