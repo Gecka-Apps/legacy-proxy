@@ -112,19 +112,22 @@ Backends:
   `SieveScript/*`. ManageSieve servers run one active script, while JMAP for
   Sieve (and the Bulwark filter editor) expect a server-managed `vacation`
   script to run alongside the user's active script. With the `include`
-  extension the proxy bridges that through a *master* script: when the
-  active script already includes other scripts (a hand-written `default`
-  that includes the script Roundcube manages, say) it is adopted as is and
-  only gains two tagged lines —
-  `include :personal :optional "vacation"; # legacy-proxy` and
-  `include :personal "<script>"; # legacy-proxy` — nothing else in it is
-  ever edited; the script it includes is what the client sees as active, so
-  a migrated Roundcube script is edited in place. Switching scripts comments
-  the previous include out (`# legacy-proxy disabled: …`) rather than
-  deleting it. Without such a master the proxy writes its own, named
-  `bulwark`, and activates it. The master is hidden from clients either
-  way. Without `include` it falls back to plain `SETACTIVE`, so activating
-  a filter script silences the autoresponder and vice versa.
+  extension the proxy bridges that through a *master* script, which is also
+  the registry of the scripts the proxy owns: the lines it writes there end
+  with `# legacy-proxy` (`include :personal :optional "vacation";` and the
+  include of the active owned script), an owned script switched off stays
+  registered as `# legacy-proxy disabled: include :personal "…";`, and
+  nothing else in the master is ever edited. JMAP clients see only the
+  scripts registered that way, so a script another webmail manages
+  (Roundcube's, RainLoop's, a hand-written one) is neither listed nor
+  reachable and keeps running from its own include; its name is still taken.
+  When the active script is already such a master (a hand-written `default`
+  that includes `roundcube`, say) it is adopted as is; when a plain script is
+  active, the proxy writes its own master, named `bulwark`, and carries that
+  script along untagged. The master is hidden from clients either way.
+  Without `include` it falls back to plain `SETACTIVE`: every script is then
+  in reach, and activating a filter script silences the autoresponder and
+  vice versa.
 - SMTP Submission via nodemailer.
 - CardDAV (RFC 6352) for AddressBook and ContactCard. Reads are live
   PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
@@ -188,7 +191,9 @@ Sort and filter:
   recurring events itself; the probe Bulwark uses to detect server-side
   expansion is answered with `invalidProperties` so it keeps doing so.
 - Sieve scripts can only be activated one at a time on top of `vacation`;
-  the master script handling covers exactly that pair.
+  the master script handling covers exactly that pair. Scripts the proxy did
+  not create are invisible to JMAP by design; an expert user edits them from
+  the tool that owns them.
 
 - WebSocket transport (`@fastify/websocket` is in the deps tree but no `/jmap/ws`
   handler is registered, so the capability is not advertised).
