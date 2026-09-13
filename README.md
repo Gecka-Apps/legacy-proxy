@@ -112,12 +112,16 @@ Backends:
   `SieveScript/*`. ManageSieve servers run one active script, while JMAP for
   Sieve (and the Bulwark filter editor) expect a server-managed `vacation`
   script to run alongside the user's active script. With the `include`
-  extension the proxy bridges that through a *master* script, which is also
-  the registry of the scripts the proxy owns: the lines it writes there end
-  with `# legacy-proxy` (`include :personal :optional "vacation";` and the
+  extension the proxy bridges that through a *master* script named `main`,
+  following the convention in [CONVENTION.md](CONVENTION.md) so that other
+  webmails can share the slot. The master is also the registry of the
+  scripts the proxy owns: the lines it writes there end with
+  `# jmap-legacy-proxy` (`include :personal :optional "vacation";` and the
   include of the active owned script), an owned script switched off stays
-  registered as `# legacy-proxy disabled: include :personal "…";`, and
-  nothing else in the master is ever edited. JMAP clients see only the
+  registered as `# jmap-legacy-proxy off: include :personal "…";`, and
+  nothing else in the master is ever edited. Masters written by earlier
+  versions (header naming the proxy, `# legacy-proxy` tag) are still read
+  and are rewritten in the current form on their next change. JMAP clients see only the
   scripts registered that way, so a script another webmail manages
   (Roundcube's, RainLoop's, a hand-written one) is neither listed nor
   reachable and keeps running from its own include; its name is still taken.
