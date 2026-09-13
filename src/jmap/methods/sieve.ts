@@ -7,8 +7,10 @@
 // download route from a live GETSCRIPT, see server.ts.
 //
 // The single-active-script constraint of ManageSieve is bridged by the
-// wrapper in ../../sieve/manager.ts; every "active" notion here goes through
-// it.
+// master script in ../../sieve/manager.ts, which is also the registry of the
+// scripts the proxy owns: every "active" and "visible" notion here goes
+// through it. A script another client manages is neither listed nor
+// reachable, but its name is still taken.
 
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
@@ -22,9 +24,11 @@ import {
   VACATION_NAME,
   WRAPPER_NAME,
   activateUserScript,
-  activeUserScript,
   isNonexistent,
   projectScripts,
+  registerScript,
+  scriptsState,
+  unregisterScript,
 } from "../../sieve/manager.js";
 import { changesOrCannotCalculate, type ChangesResponse } from "./_shared.js";
 import { log } from "../../util/log.js";
@@ -109,8 +113,7 @@ export async function fetchScriptBody(ctx: SieveCtx, name: string): Promise<stri
 
 async function listProjected(c: SieveClient): Promise<SieveScriptJson[]> {
   const raw = await c.listScripts();
-  const { active, hidden } = await activeUserScript(c, raw);
-  const view = projectScripts(raw, active, hidden);
+  const view = projectScripts(raw, await scriptsState(c, raw));
   const out: SieveScriptJson[] = [];
   for (const s of view) {
     let body = "";
@@ -231,12 +234,13 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
 
   await withClient(ctx, async (c) => {
     let raw = await c.listScripts();
-    const state = await activeUserScript(c, raw);
+    const state = await scriptsState(c, raw);
     let active = state.active;
-    // The master script (ours or the user's own include-based one) is not
-    // addressable through JMAP: not listed, not updatable, not activatable.
-    const hidden = state.hidden;
-    const known = () => new Set(raw.filter((s) => s.name !== hidden).map((s) => s.name));
+    // Every name on the server is taken, the master's and foreign scripts'
+    // included: PUTSCRIPT would silently overwrite them.
+    const taken = () => new Set(raw.map((s) => s.name));
+    // Only owned scripts can be updated, destroyed or activated.
+    const owned = new Set(state.owned);
 
     // -- create
     for (const [tempId, spec] of Object.entries(args.create ?? {})) {
@@ -245,11 +249,11 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
         (out.notCreated ??= {})[tempId] = name;
         continue;
       }
-      if (known().has(name)) {
+      if (taken().has(name)) {
         (out.notCreated ??= {})[tempId] = setError("alreadyExists", `a script named "${name}" exists`, ["name"]);
         continue;
       }
-      if (known().size >= MAX_SCRIPTS) {
+      if (owned.size >= MAX_SCRIPTS) {
         (out.notCreated ??= {})[tempId] = setError("overQuota", `at most ${MAX_SCRIPTS} scripts`);
         continue;
       }
@@ -260,7 +264,9 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
       }
       try {
         await c.putScript(name, body);
+        await registerScript(c, name);
         raw = [...raw, { name, active: false }];
+        owned.add(name);
         createdNames.set(tempId, name);
         changed = true;
         (out.created ??= {})[tempId] = { id: scriptId(name), blobId: scriptBlobId(name, body), isActive: false };
@@ -273,7 +279,7 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
     // -- update
     for (const [id, spec] of Object.entries(args.update ?? {})) {
       const current = scriptName(id);
-      if (!current || !known().has(current) || current === VACATION_NAME) {
+      if (!current || !owned.has(current)) {
         (out.notUpdated ??= {})[id] = setError("notFound");
         continue;
       }
@@ -295,15 +301,20 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
             (out.notUpdated ??= {})[id] = next;
             continue;
           }
-          if (known().has(next)) {
+          if (taken().has(next)) {
             (out.notUpdated ??= {})[id] = setError("alreadyExists", `a script named "${next}" exists`, ["name"]);
             continue;
           }
           await c.renameScript(current, next);
           raw = raw.map((s) => (s.name === current ? { ...s, name: next } : s));
+          owned.delete(current);
+          owned.add(next);
+          await unregisterScript(c, current);
           if (active === current) {
             active = next;
             await activateUserScript(c, next);
+          } else {
+            await registerScript(c, next);
           }
           changed = true;
           if (blobIdOut) blobIdOut = blobIdOut.replace(scriptId(current), scriptId(next));
@@ -318,7 +329,7 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
     // -- destroy
     for (const id of args.destroy ?? []) {
       const name = scriptName(id);
-      if (!name || !known().has(name) || name === VACATION_NAME) {
+      if (!name || !owned.has(name)) {
         (out.notDestroyed ??= {})[id] = setError("notFound");
         continue;
       }
@@ -328,7 +339,9 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
       }
       try {
         await c.deleteScript(name);
+        await unregisterScript(c, name);
         raw = raw.filter((s) => s.name !== name);
+        owned.delete(name);
         changed = true;
         (out.destroyed ??= []).push(id);
       } catch (e) {
@@ -344,7 +357,7 @@ export async function sieveScriptSet(args: SetArgs, ctx: SieveCtx): Promise<SetR
       if (args.onSuccessActivateScript != null) {
         const ref = args.onSuccessActivateScript;
         target = ref.startsWith("#") ? (createdNames.get(ref.slice(1)) ?? null) : scriptName(ref);
-        if (!target || !known().has(target) || target === VACATION_NAME) {
+        if (!target || !owned.has(target)) {
           throw new JmapError("invalidArguments", `onSuccessActivateScript: unknown script ${ref}`);
         }
       }

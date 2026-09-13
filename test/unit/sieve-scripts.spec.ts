@@ -6,7 +6,7 @@
 import net from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { SieveClient } from "../../src/sieve/client.js";
-import { WRAPPER_NAME, buildWrapper, listScriptsView, parseWrapper, retargetMaster } from "../../src/sieve/manager.js";
+import { WRAPPER_NAME, buildWrapper, listScriptsView, ownedScriptsOf, parseWrapper, registerInMaster, retargetMaster, unregisterFromMaster } from "../../src/sieve/manager.js";
 import { readVacation, writeVacation } from "../../src/sieve/vacation.js";
 import { sieveScriptGet, sieveScriptSet, sieveScriptValidate, scriptId, type SieveCtx } from "../../src/jmap/methods/sieve.js";
 import { vacationGet, vacationSet } from "../../src/jmap/methods/vacation.js";
@@ -191,17 +191,25 @@ describe("wrapper script", () => {
     expect(parseWrapper("# something else\nkeep;")).toEqual([]);
   });
 
-  it("hides itself and derives isActive from its includes", async () => {
+  it("hides itself, shows only the scripts it registers and derives isActive from its includes", async () => {
     fake.scripts.set("filters", "keep;");
     fake.scripts.set("other", "keep;");
-    fake.scripts.set(WRAPPER_NAME, buildWrapper("filters"));
+    fake.scripts.set("old", "keep;");
+    fake.scripts.set(WRAPPER_NAME, registerInMaster(buildWrapper("filters"), "old"));
     fake.active = WRAPPER_NAME;
     const c = await client();
     expect(await listScriptsView(c)).toEqual([
       { name: "filters", isActive: true },
-      { name: "other", isActive: false },
+      { name: "old", isActive: false },
     ]);
     await c.logout();
+  });
+
+  it("carries a foreign active script untagged and never reports it as ours", () => {
+    const body = buildWrapper("filters", "roundcube");
+    expect(parseWrapper(body)).toEqual(["vacation", "roundcube", "filters"]);
+    expect(ownedScriptsOf(body)).toEqual(["filters"]);
+    expect(retargetMaster(body, null)).toContain('include :personal "roundcube";\r\n');
   });
 });
 
@@ -248,8 +256,12 @@ describe("SieveScript/set", () => {
     const off = await sieveScriptSet({ accountId: "7", onSuccessActivateScript: null }, ctx);
     expect(off.updated?.[scriptId("filters")]).toEqual({ isActive: false });
     expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation"]);
+    expect(ownedScriptsOf(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["filters"]);
+    const still = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(still.list.map((x) => [x.name, x.isActive])).toEqual([["filters", false]]);
     const d = await sieveScriptSet({ accountId: "7", destroy: [scriptId("filters")] }, ctx);
     expect(d.destroyed).toEqual([scriptId("filters")]);
+    expect(ownedScriptsOf(fake.scripts.get(WRAPPER_NAME)!)).toEqual([]);
   });
 
   it("falls back to plain SETACTIVE when the server lacks include", async () => {
@@ -301,29 +313,31 @@ describe("vacation state", () => {
     fake.active = "handmade";
     const c = await client();
     expect((await readVacation(c)).isEnabled).toBe(false);
-    // Re-enabling through the proxy wires the wrapper and carries the user's script along.
+    // Re-enabling through the proxy wires the wrapper and carries the user's
+    // script along, untagged: it keeps running without becoming ours.
     await writeVacation(c, { isEnabled: true, textBody: "x" });
     expect(fake.active).toBe(WRAPPER_NAME);
     expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "handmade"]);
+    expect(ownedScriptsOf(fake.scripts.get(WRAPPER_NAME)!)).toEqual([]);
+    expect(await listScriptsView(c)).toEqual([{ name: "vacation", isActive: false }]);
     expect((await readVacation(c)).isEnabled).toBe(true);
     await c.logout();
   });
 });
 
 describe("foreign script named like the wrapper", () => {
-  it("stays visible, is renamed out of the way on activation, and keeps running", async () => {
+  it("is renamed out of the way on activation and keeps running, without becoming ours", async () => {
     fake.scripts.set(WRAPPER_NAME, 'require ["fileinto"];\nfileinto "Old";');
     fake.active = WRAPPER_NAME;
     const g = await sieveScriptGet({ accountId: "7" }, ctx);
-    expect(g.list).toEqual([expect.objectContaining({ name: WRAPPER_NAME, isActive: true })]);
+    expect(g.list).toEqual([]);
 
     await vacationSet({ accountId: "7", update: { singleton: { isEnabled: true, textBody: "away" } } }, ctx);
     expect(fake.scripts.get(WRAPPER_NAME)).toMatch(/^# Managed by legacy-proxy/);
     expect(fake.scripts.get("bulwark-1")).toContain('fileinto "Old"');
     expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "bulwark-1"]);
     const after = await sieveScriptGet({ accountId: "7" }, ctx);
-    expect(after.list.map((s) => [s.name, s.isActive])).toEqual(expect.arrayContaining([["bulwark-1", true], ["vacation", false]]));
-    expect(after.list.some((s) => s.name === WRAPPER_NAME)).toBe(false);
+    expect(after.list.map((s) => [s.name, s.isActive])).toEqual([["vacation", false]]);
   });
 });
 
@@ -337,9 +351,9 @@ describe("existing include-based master script (Roundcube migration)", () => {
     fake.active = "default";
   });
 
-  it("shows the included script as active and hides the master", async () => {
+  it("shows neither the master nor the scripts it includes on its own", async () => {
     const g = await sieveScriptGet({ accountId: "7" }, ctx);
-    expect(g.list.map((x) => [x.name, x.isActive])).toEqual([["roundcube", true]]);
+    expect(g.list).toEqual([]);
   });
 
   it("adds only a tagged vacation include to the master when the responder is set", async () => {
@@ -352,39 +366,77 @@ describe("existing include-based master script (Roundcube migration)", () => {
     expect((await vacationGet({ accountId: "7" }, ctx)).list[0]).toMatchObject({ isEnabled: true });
   });
 
-  it("switches the user script by commenting the old include out and tagging the new one", async () => {
+  it("adds its own script next to the foreign includes, which keep running", async () => {
     const blobId = upload('require ["fileinto"];\nif header :contains "subject" "x" { fileinto "X"; }');
     const r = await sieveScriptSet({ accountId: "7", create: { s: { name: "filters", blobId } }, onSuccessActivateScript: "#s" }, ctx);
     expect(r.notCreated).toBeNull();
     const master = fake.scripts.get("default")!;
-    expect(master).toContain('# legacy-proxy disabled: include :personal "roundcube";');
+    expect(master.startsWith(MASTER.trimEnd())).toBe(true);
+    expect(master).toContain('include :personal "roundcube";\r\n');
+    expect(master).toContain('include :personal :optional "vacation"; # legacy-proxy');
     expect(master).toContain('include :personal "filters"; # legacy-proxy');
-    expect(master).toContain('include :global "corporate";');
-    expect(master).toContain('fileinto "Junk"');
+    expect(master).not.toContain("disabled");
     expect(fake.active).toBe("default");
     const g = await sieveScriptGet({ accountId: "7" }, ctx);
-    expect(g.list.map((x) => [x.name, x.isActive]).sort()).toEqual([["filters", true], ["roundcube", false], ["vacation", false]].sort().filter((e) => fake.scripts.has(e[0] as string)));
+    expect(g.list.map((x) => [x.name, x.isActive])).toEqual([["filters", true]]);
 
-    // Back to roundcube: our line goes, theirs is restored verbatim.
-    await sieveScriptSet({ accountId: "7", onSuccessActivateScript: scriptId("roundcube") }, ctx);
-    const back = fake.scripts.get("default")!;
-    expect(back).toContain('include :personal "roundcube";\r\n');
-    expect(back).not.toContain("disabled");
-    expect(back).not.toContain('"filters"');
+    // A second owned script: the first is switched off in place, roundcube untouched.
+    const r2 = await sieveScriptSet({ accountId: "7", create: { t: { name: "more", blobId: upload("keep;") } }, onSuccessActivateScript: "#t" }, ctx);
+    expect(r2.notCreated).toBeNull();
+    const two = fake.scripts.get("default")!;
+    expect(two).toContain('# legacy-proxy disabled: include :personal "filters";');
+    expect(two).toContain('include :personal "more"; # legacy-proxy');
+    expect(two).toContain('include :personal "roundcube";\r\n');
+    const g2 = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(g2.list.map((x) => [x.name, x.isActive]).sort()).toEqual([["filters", false], ["more", true]]);
+
+    // roundcube is out of reach through JMAP even by id, and its name is taken.
+    const u = await sieveScriptSet({ accountId: "7", update: { [scriptId("roundcube")]: { blobId: upload("keep;") } } }, ctx);
+    expect(u.notUpdated?.[scriptId("roundcube")]).toMatchObject({ type: "notFound" });
+    expect(fake.scripts.get("roundcube")).toBe(ROUNDCUBE);
+    const dup = await sieveScriptSet({ accountId: "7", create: { d: { name: "roundcube", blobId: upload("keep;") } } }, ctx);
+    expect(dup.notCreated?.d).toMatchObject({ type: "alreadyExists" });
+    expect(fake.scripts.get("roundcube")).toBe(ROUNDCUBE);
   });
 
-  it("refuses to update or destroy the master through JMAP", async () => {
+  it("renames an owned script and follows it in the master", async () => {
+    await sieveScriptSet({ accountId: "7", create: { s: { name: "filters", blobId: upload("keep;") } }, onSuccessActivateScript: "#s" }, ctx);
+    const r = await sieveScriptSet({ accountId: "7", update: { [scriptId("filters")]: { name: "rules" } } }, ctx);
+    expect(r.notUpdated).toBeNull();
+    const master = fake.scripts.get("default")!;
+    expect(master).toContain('include :personal "rules"; # legacy-proxy');
+    expect(master).not.toContain('"filters"');
+    expect(fake.scripts.has("rules")).toBe(true);
+    const g = await sieveScriptGet({ accountId: "7" }, ctx);
+    expect(g.list.map((x) => [x.name, x.isActive])).toEqual([["rules", true]]);
+  });
+
+  it("refuses to update, destroy or overwrite the master through JMAP", async () => {
     const d = await sieveScriptSet({ accountId: "7", destroy: [scriptId("default")] }, ctx);
     expect(d.notDestroyed?.[scriptId("default")]).toMatchObject({ type: "notFound" });
     expect(fake.scripts.has("default")).toBe(true);
+    const c = await sieveScriptSet({ accountId: "7", create: { m: { name: "default", blobId: upload("keep;") } } }, ctx);
+    expect(c.notCreated?.m).toMatchObject({ type: "alreadyExists" });
+    expect(fake.scripts.get("default")).toBe(MASTER);
   });
 });
 
 describe("retargetMaster", () => {
-  it("adds a require when the master lacks one and keeps line endings", () => {
+  it("adds a require when the master lacks one, keeps line endings and foreign includes", () => {
     const out = retargetMaster('include :personal "a";\n', "b");
-    expect(out).toBe('require ["include"];\n# legacy-proxy disabled: include :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\ninclude :personal "b"; # legacy-proxy\n');
-    expect(retargetMaster(out, null)).toBe('require ["include"];\n# legacy-proxy disabled: include :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n');
+    expect(out).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\ninclude :personal "b"; # legacy-proxy\n');
+    expect(retargetMaster(out, null)).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n# legacy-proxy disabled: include :personal "b";\n');
+    expect(retargetMaster(retargetMaster(out, null), "b")).toBe(out);
+  });
+
+  it("registers and forgets owned scripts without touching the rest", () => {
+    const base = 'require ["include"];\ninclude :personal "a";\n';
+    const reg = registerInMaster(base, "x");
+    expect(reg).toBe(base + '# legacy-proxy disabled: include :personal "x";\n');
+    expect(registerInMaster(reg, "x")).toBe(reg);
+    expect(ownedScriptsOf(reg)).toEqual(["x"]);
+    expect(unregisterFromMaster(reg, "x")).toBe(base);
+    expect(unregisterFromMaster(retargetMaster(reg, "x"), "x")).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n');
   });
 });
 
