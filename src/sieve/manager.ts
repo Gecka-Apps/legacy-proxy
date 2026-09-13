@@ -10,21 +10,27 @@
 // one active script.
 //
 // With the `include` extension (RFC 6609) the active script can be a
-// *master* that includes the others, and the proxy confines itself to the
-// scripts it created. The master, whoever wrote it, is the registry:
+// *master* that only includes the others, one rule script per line. That
+// is the convention described in CONVENTION.md, shared with any webmail
+// that wants to follow it: the master, whoever wrote it, is the registry,
+// and each client signs the lines it manages with its own tag.
 //
-//   include :personal "rainloop.user";                        <- not ours, never touched
-//   include :personal "roundcube";                            <- idem
-//   include :personal :optional "vacation"; # legacy-proxy    <- ours
-//   include :personal "filters"; # legacy-proxy               <- ours, the active one
-//   # legacy-proxy disabled: include :personal "old";         <- ours, inactive
+//   include :personal "rainloop.user";                             <- nobody's, never touched
+//   include :personal "roundcube"; # roundcube                     <- another client's
+//   include :personal :optional "vacation"; # jmap-legacy-proxy    <- ours
+//   include :personal "filters"; # jmap-legacy-proxy               <- ours, the active one
+//   # jmap-legacy-proxy off: include :personal "old";              <- ours, inactive
 //
-// A JMAP client sees only the scripts referenced by a tagged line, live or
-// disabled, so it can neither open nor overwrite a script another webmail
-// manages; those keep running from their own untagged includes. The master
+// A JMAP client sees only the scripts referenced by a line carrying its
+// tag, live or off, so it can neither open nor overwrite a script another
+// webmail manages; those keep running from their own includes. The master
 // itself is hidden. When no master exists the proxy writes its own, named
 // `main`, carrying the script that was active (untagged) so it keeps
 // running.
+//
+// Masters written before the convention had a header naming this proxy and
+// a "# legacy-proxy" tag. They are read as ours and rewritten in the current
+// form the first time one of their lines changes.
 //
 // Without `include` we fall back to plain SETACTIVE semantics: the proxy
 // then owns whatever is active, and activating a filter script silences the
@@ -36,12 +42,28 @@ import { SieveClient, SieveCommandError, type SieveScriptInfo } from "./client.j
 export const WRAPPER_NAME = "main";
 /** RFC 9661 §4: the autoresponder lives in a script literally named "vacation". */
 export const VACATION_NAME = "vacation";
+/** How this client signs the master lines it manages. */
+export const CLIENT_TAG = "jmap-legacy-proxy";
 
-const WRAPPER_HEADER = "# Managed by legacy-proxy: activates the user's scripts via include.";
+/** First line of a master written to the convention; the rest is for humans. */
+const MAIN_SIGNATURE = "# main: the active script only activates rule scripts, through include (RFC 6609).";
+const MAIN_HEADER = [
+  MAIN_SIGNATURE,
+  "# Each line is one script that keeps running as long as its include is live.",
+  '# A trailing "# <client>" comment marks the line as managed by that client,',
+  '# which alone lists, edits and switches it off ("# <client> off: include ...").',
+  "# Lines without a tag belong to nobody: leave them alone.",
+  "# Do not put rules here; put them in a script of their own and include it.",
+];
 /** Trailing comment on the lines the proxy owns. */
-const OURS = "# legacy-proxy";
+const OURS = `# ${CLIENT_TAG}`;
 /** Prefix of an owned include switched off in place: the script stays registered. */
-const DISABLED = "# legacy-proxy disabled: ";
+const DISABLED = `# ${CLIENT_TAG} off: `;
+
+/** Forms written before the convention, still recognised on read. */
+const LEGACY_HEADER = "# Managed by legacy-proxy: activates the user's scripts via include.";
+const LEGACY_OURS = "# legacy-proxy";
+const LEGACY_DISABLED = "# legacy-proxy disabled: ";
 
 export interface ScriptView {
   name: string;
@@ -61,6 +83,16 @@ function includeLine(name: string, optional = false): string {
   return `include :personal${optional ? " :optional" : ""} "${escapeString(name)}";`;
 }
 
+/** An include of `name` in our live form. */
+function ownedLine(name: string, optional = false): string {
+  return `${includeLine(name, optional)} ${OURS}`;
+}
+
+/** An include of `name` in our switched-off form. */
+function offLine(name: string): string {
+  return `${DISABLED}${includeLine(name)}`;
+}
+
 // -- master script bodies --------------------------------------------------------
 
 /**
@@ -69,9 +101,9 @@ function includeLine(name: string, optional = false): string {
  * must keep running, included without our tag.
  */
 export function buildWrapper(userScript: string | null, carried: string | null = null): string {
-  const lines = [WRAPPER_HEADER, 'require ["include"];', `${includeLine(VACATION_NAME, true)} ${OURS}`];
+  const lines = [...MAIN_HEADER, 'require ["include"];', ownedLine(VACATION_NAME, true)];
   if (carried) lines.push(includeLine(carried));
-  if (userScript) lines.push(`${includeLine(userScript)} ${OURS}`);
+  if (userScript) lines.push(ownedLine(userScript));
   return lines.join("\r\n") + "\r\n";
 }
 
@@ -79,7 +111,7 @@ export interface IncludeLine {
   name: string;
   /** `:global` includes come from the server's shared directory; never a user script. */
   global: boolean;
-  /** Carries our `# legacy-proxy` tag. */
+  /** Carries our tag, current or legacy. */
   ours: boolean;
 }
 
@@ -91,23 +123,25 @@ export function parseIncludes(body: string): IncludeLine[] {
   let m: RegExpExecArray | null;
   INCLUDE_RE.lastIndex = 0;
   while ((m = INCLUDE_RE.exec(body)) !== null) {
+    const tag = (m[3] ?? "").trim();
     out.push({
       name: (m[2] ?? "").replace(/\\(.)/g, "$1"),
       global: /:global\b/.test(m[1] ?? ""),
-      ours: (m[3] ?? "").trim() === OURS,
+      ours: tag === OURS || tag === LEGACY_OURS,
     });
   }
   return out;
 }
 
-/** Names included by our own master body, live lines only. Returns [] for a foreign script. */
+/** Names included by a convention master body, live lines only. Returns [] for a foreign script. */
 export function parseWrapper(body: string): string[] {
-  if (!body.startsWith(WRAPPER_HEADER)) return [];
+  if (!isOurWrapperBody(body)) return [];
   return parseIncludes(body).map((i) => i.name);
 }
 
+/** Written to the convention, by this proxy or another client, or by this proxy before it. */
 export function isOurWrapperBody(body: string): boolean {
-  return body.startsWith(WRAPPER_HEADER);
+  return body.startsWith(MAIN_SIGNATURE) || body.startsWith(LEGACY_HEADER);
 }
 
 /** A script acts as a master when it includes other personal scripts. */
@@ -118,8 +152,9 @@ export function isMasterBody(body: string): boolean {
 /** The owned include switched off on this line, if it is one. */
 function disabledInclude(line: string): IncludeLine | null {
   const t = line.trimStart();
-  if (!t.startsWith(DISABLED)) return null;
-  const inc = parseIncludes(t.slice(DISABLED.length))[0];
+  const prefix = t.startsWith(DISABLED) ? DISABLED : t.startsWith(LEGACY_DISABLED) ? LEGACY_DISABLED : null;
+  if (!prefix) return null;
+  const inc = parseIncludes(t.slice(prefix.length))[0];
   return inc && !inc.global ? inc : null;
 }
 
@@ -147,9 +182,10 @@ function eolOf(body: string): string {
   return body.includes("\r\n") ? "\r\n" : "\n";
 }
 
-/** Body lines with trailing blank lines dropped, so additions sit right after the content. */
+/** Body lines with trailing blank lines dropped, so additions sit right after the content. Migrates the legacy header. */
 function trimmedLines(body: string): string[] {
   const lines = body.split(/\r?\n/);
+  if (lines[0] === LEGACY_HEADER) lines.splice(0, 1, ...MAIN_HEADER);
   while (lines.length && lines[lines.length - 1]!.trim() === "") lines.pop();
   return lines;
 }
@@ -172,10 +208,10 @@ export function retargetMaster(body: string, name: string | null): string {
     const off = disabledInclude(line);
     if (off) {
       if (name !== null && off.name === name) {
-        out.push(`${includeLine(name)} ${OURS}`);
+        out.push(ownedLine(name));
         hasTarget = true;
       } else {
-        out.push(raw);
+        out.push(offLine(off.name));
       }
       continue;
     }
@@ -186,19 +222,19 @@ export function retargetMaster(body: string, name: string | null): string {
     }
     if (inc.name === VACATION_NAME) {
       hasVacation = true;
-      out.push(raw);
+      out.push(ownedLine(VACATION_NAME, true));
       continue;
     }
     if (name !== null && inc.name === name) {
       hasTarget = true;
-      out.push(raw);
+      out.push(ownedLine(name));
       continue;
     }
-    out.push(`${DISABLED}${includeLine(inc.name)}`);
+    out.push(offLine(inc.name));
   }
 
-  if (!hasVacation) out.push(`${includeLine(VACATION_NAME, true)} ${OURS}`);
-  if (name !== null && !hasTarget) out.push(`${includeLine(name)} ${OURS}`);
+  if (!hasVacation) out.push(ownedLine(VACATION_NAME, true));
+  if (name !== null && !hasTarget) out.push(ownedLine(name));
   return ensureRequire(out.join(eol) + eol, eol);
 }
 
@@ -207,7 +243,7 @@ export function registerInMaster(body: string, name: string): string {
   if (ownedScriptsOf(body).includes(name)) return body;
   const eol = eolOf(body);
   const out = trimmedLines(body);
-  out.push(`${DISABLED}${includeLine(name)}`);
+  out.push(offLine(name));
   return ensureRequire(out.join(eol) + eol, eol);
 }
 

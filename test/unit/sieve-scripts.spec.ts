@@ -6,7 +6,7 @@
 import net from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { SieveClient } from "../../src/sieve/client.js";
-import { WRAPPER_NAME, buildWrapper, listScriptsView, ownedScriptsOf, parseWrapper, registerInMaster, retargetMaster, unregisterFromMaster } from "../../src/sieve/manager.js";
+import { WRAPPER_NAME, buildWrapper, isOurWrapperBody, listScriptsView, ownedScriptsOf, parseWrapper, registerInMaster, retargetMaster, unregisterFromMaster } from "../../src/sieve/manager.js";
 import { readVacation, writeVacation } from "../../src/sieve/vacation.js";
 import { sieveScriptGet, sieveScriptSet, sieveScriptValidate, scriptId, type SieveCtx } from "../../src/jmap/methods/sieve.js";
 import { vacationGet, vacationSet } from "../../src/jmap/methods/vacation.js";
@@ -333,7 +333,7 @@ describe("foreign script named like the wrapper", () => {
     expect(g.list).toEqual([]);
 
     await vacationSet({ accountId: "7", update: { singleton: { isEnabled: true, textBody: "away" } } }, ctx);
-    expect(fake.scripts.get(WRAPPER_NAME)).toMatch(/^# Managed by legacy-proxy/);
+    expect(fake.scripts.get(WRAPPER_NAME)).toMatch(/^# main: /);
     expect(fake.scripts.get("main-1")).toContain('fileinto "Old"');
     expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "main-1"]);
     const after = await sieveScriptGet({ accountId: "7" }, ctx);
@@ -362,7 +362,7 @@ describe("existing include-based master script (Roundcube migration)", () => {
     expect(fake.scripts.has(WRAPPER_NAME)).toBe(false);
     const master = fake.scripts.get("default")!;
     expect(master.startsWith(MASTER.trimEnd())).toBe(true);
-    expect(master.trimEnd().split("\r\n").pop()).toBe('include :personal :optional "vacation"; # legacy-proxy');
+    expect(master.trimEnd().split("\r\n").pop()).toBe('include :personal :optional "vacation"; # jmap-legacy-proxy');
     expect((await vacationGet({ accountId: "7" }, ctx)).list[0]).toMatchObject({ isEnabled: true });
   });
 
@@ -373,8 +373,8 @@ describe("existing include-based master script (Roundcube migration)", () => {
     const master = fake.scripts.get("default")!;
     expect(master.startsWith(MASTER.trimEnd())).toBe(true);
     expect(master).toContain('include :personal "roundcube";\r\n');
-    expect(master).toContain('include :personal :optional "vacation"; # legacy-proxy');
-    expect(master).toContain('include :personal "filters"; # legacy-proxy');
+    expect(master).toContain('include :personal :optional "vacation"; # jmap-legacy-proxy');
+    expect(master).toContain('include :personal "filters"; # jmap-legacy-proxy');
     expect(master).not.toContain("disabled");
     expect(fake.active).toBe("default");
     const g = await sieveScriptGet({ accountId: "7" }, ctx);
@@ -384,8 +384,8 @@ describe("existing include-based master script (Roundcube migration)", () => {
     const r2 = await sieveScriptSet({ accountId: "7", create: { t: { name: "more", blobId: upload("keep;") } }, onSuccessActivateScript: "#t" }, ctx);
     expect(r2.notCreated).toBeNull();
     const two = fake.scripts.get("default")!;
-    expect(two).toContain('# legacy-proxy disabled: include :personal "filters";');
-    expect(two).toContain('include :personal "more"; # legacy-proxy');
+    expect(two).toContain('# jmap-legacy-proxy off: include :personal "filters";');
+    expect(two).toContain('include :personal "more"; # jmap-legacy-proxy');
     expect(two).toContain('include :personal "roundcube";\r\n');
     const g2 = await sieveScriptGet({ accountId: "7" }, ctx);
     expect(g2.list.map((x) => [x.name, x.isActive]).sort()).toEqual([["filters", false], ["more", true]]);
@@ -404,7 +404,7 @@ describe("existing include-based master script (Roundcube migration)", () => {
     const r = await sieveScriptSet({ accountId: "7", update: { [scriptId("filters")]: { name: "rules" } } }, ctx);
     expect(r.notUpdated).toBeNull();
     const master = fake.scripts.get("default")!;
-    expect(master).toContain('include :personal "rules"; # legacy-proxy');
+    expect(master).toContain('include :personal "rules"; # jmap-legacy-proxy');
     expect(master).not.toContain('"filters"');
     expect(fake.scripts.has("rules")).toBe(true);
     const g = await sieveScriptGet({ accountId: "7" }, ctx);
@@ -424,19 +424,19 @@ describe("existing include-based master script (Roundcube migration)", () => {
 describe("retargetMaster", () => {
   it("adds a require when the master lacks one, keeps line endings and foreign includes", () => {
     const out = retargetMaster('include :personal "a";\n', "b");
-    expect(out).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\ninclude :personal "b"; # legacy-proxy\n');
-    expect(retargetMaster(out, null)).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n# legacy-proxy disabled: include :personal "b";\n');
+    expect(out).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # jmap-legacy-proxy\ninclude :personal "b"; # jmap-legacy-proxy\n');
+    expect(retargetMaster(out, null)).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # jmap-legacy-proxy\n# jmap-legacy-proxy off: include :personal "b";\n');
     expect(retargetMaster(retargetMaster(out, null), "b")).toBe(out);
   });
 
   it("registers and forgets owned scripts without touching the rest", () => {
     const base = 'require ["include"];\ninclude :personal "a";\n';
     const reg = registerInMaster(base, "x");
-    expect(reg).toBe(base + '# legacy-proxy disabled: include :personal "x";\n');
+    expect(reg).toBe(base + '# jmap-legacy-proxy off: include :personal "x";\n');
     expect(registerInMaster(reg, "x")).toBe(reg);
     expect(ownedScriptsOf(reg)).toEqual(["x"]);
     expect(unregisterFromMaster(reg, "x")).toBe(base);
-    expect(unregisterFromMaster(retargetMaster(reg, "x"), "x")).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # legacy-proxy\n');
+    expect(unregisterFromMaster(retargetMaster(reg, "x"), "x")).toBe('require ["include"];\ninclude :personal "a";\ninclude :personal :optional "vacation"; # jmap-legacy-proxy\n');
   });
 });
 
@@ -454,5 +454,33 @@ describe("vacation migration", () => {
     expect(fake.active).toBe(WRAPPER_NAME);
     expect((await readVacation(c)).isEnabled).toBe(false);
     await c.logout();
+  });
+});
+
+describe("masters written before the convention", () => {
+  const legacy =
+    "# Managed by legacy-proxy: activates the user's scripts via include.\n" +
+    'require ["include"];\n' +
+    'include :personal "roundcube";\n' +
+    'include :personal :optional "vacation"; # legacy-proxy\n' +
+    'include :personal "filters"; # legacy-proxy\n' +
+    '# legacy-proxy disabled: include :personal "old";\n';
+
+  it("are read as ours, tag and header alike", () => {
+    expect(isOurWrapperBody(legacy)).toBe(true);
+    expect(parseWrapper(legacy)).toEqual(["roundcube", "vacation", "filters"]);
+    expect(ownedScriptsOf(legacy)).toEqual(["filters", "old"]);
+  });
+
+  it("come out in the current form once a line changes, foreign lines untouched", () => {
+    const out = retargetMaster(legacy, "old");
+    expect(out.startsWith("# main: ")).toBe(true);
+    expect(out).not.toContain("legacy-proxy:");
+    expect(out).not.toContain("# legacy-proxy\n");
+    expect(out).toContain('include :personal "roundcube";\n');
+    expect(out).toContain('include :personal :optional "vacation"; # jmap-legacy-proxy\n');
+    expect(out).toContain('# jmap-legacy-proxy off: include :personal "filters";\n');
+    expect(out).toContain('include :personal "old"; # jmap-legacy-proxy\n');
+    expect(ownedScriptsOf(out)).toEqual(["old", "filters"]);
   });
 });
