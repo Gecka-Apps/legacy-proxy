@@ -23,7 +23,7 @@
 // disabled, so it can neither open nor overwrite a script another webmail
 // manages; those keep running from their own untagged includes. The master
 // itself is hidden. When no master exists the proxy writes its own, named
-// `bulwark`, carrying the script that was active (untagged) so it keeps
+// `main`, carrying the script that was active (untagged) so it keeps
 // running.
 //
 // Without `include` we fall back to plain SETACTIVE semantics: the proxy
@@ -33,7 +33,7 @@
 import { SieveClient, SieveCommandError, type SieveScriptInfo } from "./client.js";
 
 /** Name of the proxy-written master script. */
-export const WRAPPER_NAME = "bulwark";
+export const WRAPPER_NAME = "main";
 /** RFC 9661 §4: the autoresponder lives in a script literally named "vacation". */
 export const VACATION_NAME = "vacation";
 
@@ -341,8 +341,8 @@ export async function unregisterScript(client: SieveClient, name: string): Promi
 
 /**
  * A plain script named like our wrapper that we did not write (a user who
- * picked "bulwark" as a name before the proxy existed) must not be
- * overwritten. Rename it to the first free `bulwark-N` and return the name
+ * picked "main" as a name before the proxy existed) must not be
+ * overwritten. Rename it to the first free `main-N` and return the name
  * when it was the active script, so the caller carries it along.
  */
 async function rescueForeignWrapper(client: SieveClient, raw: SieveScriptInfo[]): Promise<string | null> {

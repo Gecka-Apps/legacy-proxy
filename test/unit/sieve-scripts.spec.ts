@@ -334,8 +334,8 @@ describe("foreign script named like the wrapper", () => {
 
     await vacationSet({ accountId: "7", update: { singleton: { isEnabled: true, textBody: "away" } } }, ctx);
     expect(fake.scripts.get(WRAPPER_NAME)).toMatch(/^# Managed by legacy-proxy/);
-    expect(fake.scripts.get("bulwark-1")).toContain('fileinto "Old"');
-    expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "bulwark-1"]);
+    expect(fake.scripts.get("main-1")).toContain('fileinto "Old"');
+    expect(parseWrapper(fake.scripts.get(WRAPPER_NAME)!)).toEqual(["vacation", "main-1"]);
     const after = await sieveScriptGet({ accountId: "7" }, ctx);
     expect(after.list.map((s) => [s.name, s.isActive])).toEqual([["vacation", false]]);
   });

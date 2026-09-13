@@ -123,7 +123,7 @@ Backends:
   reachable and keeps running from its own include; its name is still taken.
   When the active script is already such a master (a hand-written `default`
   that includes `roundcube`, say) it is adopted as is; when a plain script is
-  active, the proxy writes its own master, named `bulwark`, and carries that
+  active, the proxy writes its own master, named `main`, and carries that
   script along untagged. The master is hidden from clients either way.
   Without `include` it falls back to plain `SETACTIVE`: every script is then
   in reach, and activating a filter script silences the autoresponder and
