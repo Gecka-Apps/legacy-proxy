@@ -51,6 +51,14 @@ function interpolate(p: ProviderConfig): ProviderConfig {
           principalPath: p.carddav.principalPath ? env(p.carddav.principalPath) : undefined,
         }
       : null,
+    caldav: p.caldav
+      ? {
+          ...p.caldav,
+          host: env(p.caldav.host),
+          basePath: p.caldav.basePath ? env(p.caldav.basePath) : undefined,
+          principalPath: p.caldav.principalPath ? env(p.caldav.principalPath) : undefined,
+        }
+      : null,
     auth: p.auth,
   };
 }

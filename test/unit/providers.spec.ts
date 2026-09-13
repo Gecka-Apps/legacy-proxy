@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { providerForEmail, resolveProviderName } from "../../src/auth/providers.js";
+import { providerForEmail, resolveProvider, resolveProviderName } from "../../src/auth/providers.js";
 import type { AppConfig, ProviderConfig } from "../../src/util/config.js";
 
 function provider(domains?: string[]): ProviderConfig {
@@ -57,5 +57,24 @@ describe("resolveProviderName", () => {
   it("falls back to the default provider when the domain is unknown", () => {
     expect(resolveProviderName(cfg, { username: "x@unknown.tld" })).toBe("generic");
     expect(resolveProviderName(cfg, {})).toBe("generic");
+  });
+});
+
+describe("resolveProvider", () => {
+  it("keeps the DAV backends after host interpolation", () => {
+    const dav = { host: "$DAV_HOST", port: 443, secure: true, basePath: "/" };
+    const withDav = { ...cfg, providers: { generic: { ...provider(), carddav: dav, caldav: dav } } } as AppConfig;
+    process.env.DAV_HOST = "dav.example";
+    try {
+      const resolved = resolveProvider(withDav, "generic");
+      expect(resolved.carddav).toMatchObject({ host: "dav.example", port: 443, basePath: "/" });
+      expect(resolved.caldav).toMatchObject({ host: "dav.example", port: 443, basePath: "/" });
+    } finally {
+      delete process.env.DAV_HOST;
+    }
+  });
+
+  it("leaves an absent caldav at null", () => {
+    expect(resolveProvider(cfg, "generic").caldav).toBeNull();
   });
 });
