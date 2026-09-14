@@ -509,6 +509,10 @@ app.get<{ Querystring: { types?: string; closeafter?: string; ping?: string } }>
 // raw header so we never log or persist plaintext. TTL keeps memory bounded.
 const basicAuthCache = new Map<string, { accountId: number; expires: number }>();
 const BASIC_TTL_MS = 5 * 60_000;
+// Probes in flight, by the same key. A client that sends Basic on every
+// request fires several at once when the cache entry lapses; they share one
+// IMAP login instead of each opening a socket the pool then has to throw away.
+const basicAuthProbes = new Map<string, Promise<import("./state/store.js").AccountRow | null>>();
 
 async function authn(req: {
   headers: Record<string, string | string[] | undefined>;
@@ -529,39 +533,51 @@ async function authn(req: {
     if (cached && cached.expires > Date.now()) {
       return store.getAccountById(cached.accountId) ?? null;
     }
-    const decoded = Buffer.from(h.slice("Basic ".length).trim(), "base64").toString("utf8");
-    const colon = decoded.indexOf(":");
-    if (colon < 1) return null;
-    const username = decoded.slice(0, colon);
-    const password = decoded.slice(colon + 1);
-
-    const providerName = resolveProviderName(cfg, { username });
-    const provider = resolveProvider(cfg, providerName);
-    const creds: Credentials = { mech: "PLAIN", username, password };
-
-    let probe;
-    try {
-      probe = await openImap({ provider, creds });
-    } catch (e) {
-      log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
-      return null;
+    let probe = basicAuthProbes.get(cacheKey);
+    if (!probe) {
+      probe = probeBasicAuth(h, cacheKey).finally(() => basicAuthProbes.delete(cacheKey));
+      basicAuthProbes.set(cacheKey, probe);
     }
-    const vault = await sealCredentials(cfg.vaultKey, creds);
-    const account = store.upsertAccount({
-      slug: `${providerName}:${username}`,
-      kind: providerName,
-      host: provider.imap.host,
-      username,
-      vault,
-    });
-    // Keep the validated connection: the JMAP request this auth is for will
-    // need one immediately.
-    pool.adopt(account, probe);
-    basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
-    return account;
+    return probe;
   }
 
   return null;
+}
+
+async function probeBasicAuth(
+  header: string,
+  cacheKey: string,
+): Promise<import("./state/store.js").AccountRow | null> {
+  const decoded = Buffer.from(header.slice("Basic ".length).trim(), "base64").toString("utf8");
+  const colon = decoded.indexOf(":");
+  if (colon < 1) return null;
+  const username = decoded.slice(0, colon);
+  const password = decoded.slice(colon + 1);
+
+  const providerName = resolveProviderName(cfg, { username });
+  const provider = resolveProvider(cfg, providerName);
+  const creds: Credentials = { mech: "PLAIN", username, password };
+
+  let probe;
+  try {
+    probe = await openImap({ provider, creds });
+  } catch (e) {
+    log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
+    return null;
+  }
+  const vault = await sealCredentials(cfg.vaultKey, creds);
+  const account = store.upsertAccount({
+    slug: `${providerName}:${username}`,
+    kind: providerName,
+    host: provider.imap.host,
+    username,
+    vault,
+  });
+  // Keep the validated connection: the JMAP request this auth is for will
+  // need one immediately.
+  pool.adopt(account, probe);
+  basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
+  return account;
 }
 
 const port = cfg.port;

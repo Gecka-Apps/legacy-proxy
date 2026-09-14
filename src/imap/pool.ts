@@ -23,6 +23,15 @@ interface PoolEntry {
 // a meaningful idle gap.
 const NOOP_FRESHNESS_MS = 30_000;
 
+// A free connection is logged out once nobody has borrowed it for this long.
+// imapflow keeps a quiet socket in IDLE and servers never time those out, so
+// without a reaper every account that touched the proxy once keeps its whole
+// pool open for the day — on a shared server that is what fills the global
+// login-process limit. The first request after a pause pays one
+// TCP+TLS+LOGIN, the same price as after a dropped socket.
+const IDLE_MAX_MS = 5 * 60_000;
+const REAP_INTERVAL_MS = 60_000;
+
 // Two connection roles per account:
 //   - "interactive": JMAP method calls (the latency-sensitive path).
 //   - "bulk": blob downloads and thread-index scans — operations that can
@@ -50,13 +59,23 @@ export interface Lease {
 
 export class ImapPool {
   private entries = new Map<string, PoolEntry[]>();
+  // Dials in progress per pool key. A connection only lands in `entries`
+  // once the TCP+TLS+LOGIN handshake is done, and a burst of concurrent
+  // acquires all pass the cap check in that window unless the dials
+  // themselves are counted.
+  private opening = new Map<string, number>();
   // Callers parked waiting for a connection to come free, per pool key.
   private waiters = new Map<string, Array<() => void>>();
+  private reaper: NodeJS.Timeout;
 
   constructor(
     private cfg: AppConfig,
     private store: Store,
-  ) {}
+  ) {
+    this.reaper = setInterval(() => this.reapIdle(), REAP_INTERVAL_MS);
+    // A pool with nothing in it must not keep the process alive.
+    this.reaper.unref();
+  }
 
   /**
    * Borrow a connection for the duration of `fn`. The connection returns to
@@ -121,14 +140,32 @@ export class ImapPool {
       }
     }
 
-    if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE[role]) return null;
+    const inFlight = this.opening.get(key) ?? 0;
+    if ((this.entries.get(key)?.length ?? 0) + inFlight >= MAX_PER_ROLE[role]) return null;
 
-    const provider = resolveProvider(this.cfg, account.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
-    const client = await openImap({ provider, creds });
+    // The slot is taken from here on, synchronously, before the first await.
+    this.opening.set(key, inFlight + 1);
+    let client: ImapFlow;
+    try {
+      const provider = resolveProvider(this.cfg, account.kind);
+      const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
+      client = await openImap({ provider, creds });
+    } catch (err) {
+      this.dialDone(key);
+      // The slot this dial held is free again; a parked caller may fare better.
+      this.wake(key);
+      throw err;
+    }
+    this.dialDone(key);
     const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
     this.attach(account, key, entry);
     return entry;
+  }
+
+  private dialDone(key: string): void {
+    const n = (this.opening.get(key) ?? 1) - 1;
+    if (n > 0) this.opening.set(key, n);
+    else this.opening.delete(key);
   }
 
   private leaseFor(key: string, entry: PoolEntry): Lease {
@@ -171,7 +208,8 @@ export class ImapPool {
   // logged out.
   adopt(account: AccountRow, client: ImapFlow): void {
     const key = `${account.id}:interactive`;
-    if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE.interactive) {
+    const inFlight = this.opening.get(key) ?? 0;
+    if ((this.entries.get(key)?.length ?? 0) + inFlight >= MAX_PER_ROLE.interactive) {
       client.logout().catch(() => {});
       return;
     }
@@ -179,10 +217,25 @@ export class ImapPool {
     this.wake(key);
   }
 
+  /** Log out every free connection that nobody has borrowed for IDLE_MAX_MS. */
+  reapIdle(): void {
+    const cutoff = Date.now() - IDLE_MAX_MS;
+    for (const [key, list] of this.entries) {
+      for (const entry of [...list]) {
+        if (entry.busy || entry.lastUsed > cutoff) continue;
+        // Out of the pool before the LOGOUT round-trip, so no caller can
+        // borrow a socket that is on its way out.
+        this.drop(key, entry);
+        entry.client.logout().catch(() => {});
+      }
+    }
+  }
+
   private attach(account: AccountRow, key: string, entry: PoolEntry): void {
     entry.client.on("close", () => {
-      log.warn({ account: account.slug, key }, "imap connection closed");
-      this.drop(key, entry);
+      // Only a socket the pool still counted on is worth a warning; one the
+      // reaper or a borrower already dropped is closing on purpose.
+      if (this.drop(key, entry)) log.warn({ account: account.slug, key }, "imap connection closed");
       // A slot just opened up, so let a parked caller dial a replacement.
       this.wake(key);
     });
@@ -196,15 +249,19 @@ export class ImapPool {
     this.entries.set(key, list);
   }
 
-  private drop(key: string, entry: PoolEntry): void {
+  /** Forget a connection. Returns false when the pool no longer held it. */
+  private drop(key: string, entry: PoolEntry): boolean {
     const list = this.entries.get(key);
-    if (!list) return;
+    if (!list) return false;
     const i = list.indexOf(entry);
-    if (i >= 0) list.splice(i, 1);
+    if (i < 0) return false;
+    list.splice(i, 1);
     if (list.length === 0) this.entries.delete(key);
+    return true;
   }
 
   async closeAll(): Promise<void> {
+    clearInterval(this.reaper);
     for (const list of this.entries.values()) {
       for (const e of list) {
         try {
