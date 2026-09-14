@@ -14,7 +14,8 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import { projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
-import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { buildRfc822, collectBlobIds, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { readBlob } from "../blobs.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -1408,6 +1409,10 @@ interface CreatedEmailResult {
   size: number;
 }
 
+// Largest stored-message part a create may carry over, forwarded attachments
+// in practice. Uploads are bounded by the upload route itself.
+const MAX_ATTACHMENT_BLOB = 50 * 1024 * 1024;
+
 async function applyEmailCreate(
   payload: Record<string, unknown>,
   ctx: MailCtx,
@@ -1448,10 +1453,21 @@ async function applyEmailCreate(
     }
   }
 
-  const mime = await buildRfc822(
-    payload as JmapEmailCreate,
-    ctx.account.host || "localhost",
-    (blobId) => ctx.store.getUpload(blobId, ctx.account.id),
+  // Attachments come as uploads or, when forwarding, as parts of a stored
+  // message that readBlob fetches over IMAP. Both are loaded here so the
+  // MIME walk stays synchronous.
+  const create = payload as JmapEmailCreate;
+  const blobs = new Map<string, { body: Buffer; ctype: string }>();
+  for (const blobId of collectBlobIds(create)) {
+    const blob = await readBlob(
+      { account: ctx.account, store: ctx.store, pool: ctx.pool },
+      blobId,
+      MAX_ATTACHMENT_BLOB,
+    );
+    if (blob) blobs.set(blobId, blob);
+  }
+  const mime = await buildRfc822(create, ctx.account.host || "localhost", (blobId) =>
+    blobs.get(blobId) ?? null,
   );
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;

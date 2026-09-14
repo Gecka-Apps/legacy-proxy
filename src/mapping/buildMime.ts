@@ -5,6 +5,7 @@
 // quoted-printable encoding, header folding, and message id generation.
 
 import MimeNode from "nodemailer/lib/mime-node/index.js";
+import { JmapError } from "../jmap/errors.js";
 
 interface JmapAddress {
   name?: string | null;
@@ -48,6 +49,9 @@ export interface JmapEmailCreate {
   sentAt?: string | null;
   textBody?: BodyPartRef[] | null;
   htmlBody?: BodyPartRef[] | null;
+  // Simple form companion of textBody/htmlBody (RFC 8621 §4.6): leaf parts
+  // by blobId, each with its own type, name, disposition and cid.
+  attachments?: BodyStructurePart[] | null;
   bodyValues?: Record<string, BodyValue> | null;
   // Headers passed through verbatim (asRaw form). We don't attempt to
   // re-parse these; clients that send us structured forms should map them
@@ -106,9 +110,67 @@ function nodeFromBodyStructure(
     node.setContent(bodyValues[part.partId]!.value!);
   } else if (part.blobId) {
     const blob = getBlob(part.blobId);
-    if (blob) node.setContent(blob.body);
+    if (!blob) {
+      throw new JmapError("blobNotFound", `blob ${part.blobId} does not exist`, {
+        notFound: [part.blobId],
+      });
+    }
+    node.setContent(blob.body);
   }
   return node;
+}
+
+// Simple form (RFC 8621 §4.6): the server derives the MIME tree from
+// textBody, htmlBody and attachments. Text and HTML sit in a
+// multipart/alternative; inline parts referenced from the HTML by cid: are
+// grouped with it in a multipart/related; the remaining attachments hang
+// off a multipart/mixed root, in the order the client listed them.
+function nodeFromSimpleForm(
+  create: JmapEmailCreate,
+  getBlob: BlobLookup,
+  hostname: string,
+): MimeNode {
+  const text = resolveBody(create.textBody, create.bodyValues);
+  const html = resolveBody(create.htmlBody, create.bodyValues);
+  const attachments = (create.attachments ?? []).filter((a) => a.blobId);
+  const related = html
+    ? attachments.filter((a) => a.cid && (a.disposition ?? "inline").toLowerCase() === "inline")
+    : [];
+  const mixed = attachments.filter((a) => !related.includes(a));
+
+  let htmlNode: MimeNode | null = null;
+  if (html) {
+    htmlNode = new MimeNode("text/html; charset=utf-8", { hostname });
+    htmlNode.setContent(html);
+    if (related.length) {
+      const wrap = new MimeNode('multipart/related; type="text/html"', { hostname });
+      wrap.appendChild(htmlNode);
+      for (const a of related) wrap.appendChild(nodeFromBodyStructure(a, null, getBlob, hostname));
+      htmlNode = wrap;
+    }
+  }
+
+  let body: MimeNode;
+  if (text && htmlNode) {
+    body = new MimeNode("multipart/alternative", { hostname });
+    body.createChild("text/plain; charset=utf-8").setContent(text);
+    body.appendChild(htmlNode);
+  } else if (htmlNode) {
+    body = htmlNode;
+  } else {
+    body = new MimeNode("text/plain; charset=utf-8", { hostname });
+    body.setContent(text ?? "");
+  }
+
+  if (mixed.length === 0) return body;
+  const root = new MimeNode("multipart/mixed", { hostname });
+  root.appendChild(body);
+  for (const a of mixed) {
+    root.appendChild(
+      nodeFromBodyStructure({ ...a, disposition: a.disposition ?? "attachment" }, null, getBlob, hostname),
+    );
+  }
+  return root;
 }
 
 function resolveBody(
@@ -127,9 +189,10 @@ function resolveBody(
 }
 
 export interface BlobLookup {
-  // Returns the bytes for a previously-uploaded blobId, or null if missing.
-  // The lookup is synchronous for buildRfc822's MimeNode walk; loading from
-  // SQLite is cheap so a sync API is enough.
+  // Returns the bytes behind a blobId, or null when there are none: the walk
+  // then fails the create with blobNotFound. The lookup is synchronous for
+  // buildRfc822's MimeNode walk; callers load IMAP-backed blobs beforehand
+  // (see collectBlobIds).
   (blobId: string): { body: Buffer; ctype: string } | null;
 }
 
@@ -140,26 +203,11 @@ export async function buildRfc822(
 ): Promise<Buffer> {
   // Choose a root structure based on the inputs we got. Prefer `bodyStructure`
   // (RFC 8621 §4.5.1 form 1) when present — it's the canonical source of
-  // truth and drives multipart/alternative + attachments. Otherwise fall back
-  // to the simpler textBody/htmlBody form.
-  let root: MimeNode;
-  if (create.bodyStructure) {
-    root = nodeFromBodyStructure(create.bodyStructure, create.bodyValues ?? null, getBlob, hostname);
-  } else {
-    const text = resolveBody(create.textBody, create.bodyValues);
-    const html = resolveBody(create.htmlBody, create.bodyValues);
-    if (text && html) {
-      root = new MimeNode("multipart/alternative", { hostname });
-      root.createChild("text/plain; charset=utf-8").setContent(text);
-      root.createChild("text/html; charset=utf-8").setContent(html);
-    } else if (html) {
-      root = new MimeNode("text/html; charset=utf-8", { hostname });
-      root.setContent(html);
-    } else {
-      root = new MimeNode("text/plain; charset=utf-8", { hostname });
-      root.setContent(text ?? "");
-    }
-  }
+  // truth and drives multipart/alternative + attachments. Otherwise assemble
+  // the tree from the simpler textBody/htmlBody/attachments form.
+  const root: MimeNode = create.bodyStructure
+    ? nodeFromBodyStructure(create.bodyStructure, create.bodyValues ?? null, getBlob, hostname)
+    : nodeFromSimpleForm(create, getBlob, hostname);
 
   const setIfPresent = (header: string, value: string | null): void => {
     if (value) root.setHeader(header, value);
@@ -215,4 +263,19 @@ export async function buildRfc822(
       else resolve(message);
     });
   });
+}
+
+// Every blobId a create payload references, bodyStructure leaves and simple
+// form attachments alike, so the caller can load them before the synchronous
+// MIME walk.
+export function collectBlobIds(create: JmapEmailCreate): string[] {
+  const ids = new Set<string>();
+  const walk = (part: BodyStructurePart | null | undefined): void => {
+    if (!part) return;
+    if (part.blobId) ids.add(part.blobId);
+    for (const child of part.subParts ?? []) walk(child);
+  };
+  walk(create.bodyStructure);
+  for (const a of create.attachments ?? []) walk(a);
+  return [...ids];
 }

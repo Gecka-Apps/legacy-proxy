@@ -19,10 +19,14 @@ export interface BlobData {
   body: Buffer;
 }
 
-/** Upper bound for a buffered read; anything larger is treated as absent. */
+/** Default upper bound for a buffered read; anything larger is treated as absent. */
 const MAX_BUFFERED_BLOB = 8 * 1024 * 1024;
 
-export async function readBlob(ctx: BlobCtx, blobId: string): Promise<BlobData | null> {
+export async function readBlob(
+  ctx: BlobCtx,
+  blobId: string,
+  maxBytes: number = MAX_BUFFERED_BLOB,
+): Promise<BlobData | null> {
   if (blobId.startsWith("U")) {
     const up = ctx.store.getUpload(blobId, ctx.account.id);
     return up ? { ctype: up.ctype, body: up.body } : null;
@@ -54,7 +58,7 @@ export async function readBlob(ctx: BlobCtx, blobId: string): Promise<BlobData |
       let size = 0;
       for await (const chunk of dl.content as Readable) {
         size += (chunk as Buffer).length;
-        if (size > MAX_BUFFERED_BLOB) return null;
+        if (size > maxBytes) return null;
         chunks.push(chunk as Buffer);
       }
       return { ctype, body: Buffer.concat(chunks) };
