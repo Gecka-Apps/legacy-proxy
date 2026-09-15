@@ -13,7 +13,7 @@ import {
   applyPatch,
   type ContactCtx,
 } from "../../src/jmap/methods/contacts.js";
-import type { AccountRow } from "../../src/state/store.js";
+import type { AccountRow, Store } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 
@@ -212,11 +212,16 @@ const provider: ProviderConfig = {
   auth: { mech: ["PLAIN"] },
 };
 
-const ctx: ContactCtx = {
-  account: { id: 7, username: "u" } as AccountRow,
-  provider,
-  creds: { mech: "PLAIN", username: "u", password: "p" },
-};
+function fakeStore(): Store {
+  const prefs = new Map<string, unknown>();
+  return {
+    getPref: (_a: number, k: string) => prefs.get(k) ?? null,
+    setPref: (_a: number, k: string, v: unknown) => prefs.set(k, v),
+    deletePref: (_a: number, k: string) => prefs.delete(k),
+  } as unknown as Store;
+}
+
+let ctx: ContactCtx;
 
 const ALICE = [
   "BEGIN:VCARD",
@@ -238,6 +243,12 @@ beforeEach(() => {
   // cross-instance discovery/book caches must be cleared with it.
   resetCardDavCaches();
   dav = new FakeDav();
+  ctx = {
+    account: { id: 7, username: "u" } as AccountRow,
+    provider,
+    creds: { mech: "PLAIN", username: "u", password: "p" },
+    store: fakeStore(),
+  };
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -585,6 +596,89 @@ describe("AddressBook/set", () => {
     const ok = await addressBookSet({ accountId: "7", destroy: [id], onDestroyRemoveContents: true }, ctx);
     expect(ok.destroyed).toEqual([id]);
     expect(dav.books.has(href)).toBe(false);
+  });
+});
+
+describe("default address book", () => {
+  const idOf = (href: string) => Buffer.from(href).toString("base64url");
+
+  it("is the `contacts` collection whatever order the server lists them in", async () => {
+    dav.addBook("trusted-senders", "Trusted Senders");
+    dav.addBook("contacts", "Contacts");
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.map((b) => [b.name, b.isDefault])).toEqual([
+      ["Trusted Senders", false],
+      ["Contacts", true],
+    ]);
+  });
+
+  it("falls back to the first href in sorted order without a `contacts` collection", async () => {
+    dav.addBook("zeta", "Zeta");
+    dav.addBook("alpha", "Alpha");
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Alpha");
+  });
+
+  it("is where a card without addressBookIds lands", async () => {
+    const trusted = dav.addBook("trusted-senders", "Trusted Senders");
+    const contacts = dav.addBook("contacts", "Contacts");
+    const res = await contactCardSet({ accountId: "7", create: { c: { name: { full: "Bob" } } } }, ctx);
+    expect(res.notCreated).toBeNull();
+    expect(dav.books.get(contacts)!.resources.size).toBe(1);
+    expect(dav.books.get(trusted)!.resources.size).toBe(0);
+  });
+
+  it("follows onSuccessSetIsDefault across requests and reports both flips", async () => {
+    const contacts = dav.addBook("contacts", "Contacts");
+    const work = dav.addBook("work", "Work");
+    const res = await addressBookSet({ accountId: "7", onSuccessSetIsDefault: idOf(work) }, ctx);
+    expect(res.updated).toEqual({ [idOf(work)]: { isDefault: true }, [idOf(contacts)]: { isDefault: false } });
+
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Work");
+
+    const card = await contactCardSet({ accountId: "7", create: { c: { name: { full: "Bob" } } } }, ctx);
+    expect(card.notCreated).toBeNull();
+    expect(dav.books.get(work)!.resources.size).toBe(1);
+  });
+
+  it("resolves a creation reference and flags the new book in `created`", async () => {
+    const contacts = dav.addBook("contacts", "Contacts");
+    const res = await addressBookSet(
+      { accountId: "7", create: { n: { name: "Family" } }, onSuccessSetIsDefault: "#n" },
+      ctx,
+    );
+    expect(res.created?.["n"]?.isDefault).toBe(true);
+    expect(res.updated).toEqual({ [idOf(contacts)]: { isDefault: false } });
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Family");
+  });
+
+  it("ignores an unknown id and skips the change when a write failed", async () => {
+    dav.addBook("contacts", "Contacts");
+    const work = dav.addBook("work", "Work");
+
+    const unknown = await addressBookSet({ accountId: "7", onSuccessSetIsDefault: idOf(`${HOME}nope/`) }, ctx);
+    expect(unknown.updated).toBeNull();
+
+    const failed = await addressBookSet(
+      { accountId: "7", create: { x: { name: " " } }, onSuccessSetIsDefault: idOf(work) },
+      ctx,
+    );
+    expect(failed.notCreated?.["x"]).toBeDefined();
+    expect(failed.updated).toBeNull();
+
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Contacts");
+  });
+
+  it("drops back to `contacts` once the chosen book is deleted", async () => {
+    dav.addBook("contacts", "Contacts");
+    const work = dav.addBook("work", "Work");
+    await addressBookSet({ accountId: "7", onSuccessSetIsDefault: idOf(work) }, ctx);
+    await addressBookSet({ accountId: "7", destroy: [idOf(work)] }, ctx);
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.map((b) => [b.name, b.isDefault])).toEqual([["Contacts", true]]);
   });
 });
 
