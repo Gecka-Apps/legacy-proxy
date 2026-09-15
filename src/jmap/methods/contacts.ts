@@ -22,6 +22,7 @@ import type { ProviderConfig } from "../../util/config.js";
 import type { AccountRow, Store } from "../../state/store.js";
 import { accountNotFound, JmapError } from "../errors.js";
 import { log } from "../../util/log.js";
+import { DEFAULT_COLLECTION, davFlavor } from "../../util/dav-flavor.js";
 
 export interface ContactCtx {
   account: AccountRow;
@@ -117,7 +118,7 @@ const PREF_DEFAULT_BOOK = "addressbook:default";
 /**
  * The book flagged isDefault and used when a card is created without an
  * addressBookIds. The account's stored choice wins as long as that book still
- * exists; otherwise the `contacts` collection (the one a fresh account gets),
+ * exists; otherwise the collection the server sets up for a new account (per DAV flavor),
  * otherwise the first by href. CardDAV has no default-book property and the
  * server lists collections in directory order, so nothing here relies on the
  * order of the PROPFIND response.
@@ -127,7 +128,8 @@ function defaultBook(ctx: ContactCtx, books: AddressBookInfo[]): AddressBookInfo
   const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_BOOK);
   const chosen = pref ? books.find((b) => bookId(b.href) === pref) : undefined;
   if (chosen) return chosen;
-  return books.find((b) => leaf(b.href) === DEFAULT_BOOK_SLUG) ?? [...books].sort((a, b) => a.href.localeCompare(b.href))[0];
+  const slug = DEFAULT_COLLECTION[davFlavor(ctx.provider.carddav)].addressBook;
+  return books.find((b) => leaf(b.href) === slug) ?? [...books].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 function bookState(b: AddressBookInfo): string {
@@ -456,7 +458,7 @@ export async function contactCardSet(
       delete input["id"];
       const uid = typeof input["uid"] === "string" && input["uid"] ? (input["uid"] as string) : `urn:uuid:${crypto.randomUUID()}`;
       const card: JsContact = { ...(input as Partial<JsContact>), uid };
-      const vcard = serializeVCard(card);
+      const vcard = serializeVCard(card, { flavor: davFlavor(ctx.provider.carddav) });
       // Only unreserved characters in the file name so the href the server
       // echoes back in PROPFIND matches what we stored in the id.
       const resourceHref = `${picked.book.href}${crypto.randomUUID()}.vcf`;
@@ -511,7 +513,7 @@ export async function contactCardSet(
       }
       const draft = current as unknown as Record<string, unknown>;
       applyPatch(draft, cleaned);
-      const vcard = serializeVCard(draft as unknown as JsContact, { preserveFrom: existing.data });
+      const vcard = serializeVCard(draft as unknown as JsContact, { preserveFrom: existing.data, flavor: davFlavor(ctx.provider.carddav) });
       await client.putResource(parts.resourceHref, vcard, { ifMatch: existing.etag });
       (out.updated ??= {})[id] = null;
     } catch (e) {
