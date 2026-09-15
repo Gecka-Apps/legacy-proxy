@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AccountRow, Store } from "../../state/store.js";
 import { encodeCounterState } from "../../state/states.js";
 import { JmapError, accountNotFound } from "../errors.js";
@@ -58,12 +59,26 @@ function projectIdentity(account: AccountRow, store: Store): IdentityJson {
   };
 }
 
+/** An identity the account added itself, kept in the pref table under PREF_IDENTITIES. */
+type ExtraIdentity = Omit<IdentityJson, "id" | "mayDelete">;
+
+const PREF_IDENTITIES = "identities";
+
+function extraIdentities(store: Store, accountId: number): Record<string, ExtraIdentity> {
+  return store.getPref<Record<string, ExtraIdentity>>(accountId, PREF_IDENTITIES) ?? {};
+}
+
+function allIdentities(account: AccountRow, store: Store): IdentityJson[] {
+  const extras = Object.entries(extraIdentities(store, account.id)).map(([id, x]) => ({ id, ...x, mayDelete: true }));
+  return [projectIdentity(account, store), ...extras];
+}
+
 export async function identityGet(
   args: { accountId: string; ids: string[] | null },
   ctx: { account: AccountRow; store: Store },
 ): Promise<{ accountId: string; state: string; list: IdentityJson[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
-  const all = [projectIdentity(ctx.account, ctx.store)];
+  const all = allIdentities(ctx.account, ctx.store);
   const list = args.ids ? all.filter((i) => args.ids!.includes(i.id)) : all;
   const notFound = args.ids ? args.ids.filter((x) => !all.some((i) => i.id === x)) : [];
   return {
@@ -82,9 +97,11 @@ export interface IdentitySetArgs {
   destroy?: string[] | null;
 }
 
-// Editable: name, replyTo, textSignature, htmlSignature.
-// Refused: create (we expose exactly one Identity), destroy (mayDelete:false),
-// changes to email (it's the IMAP login).
+// The singleton takes name, replyTo, textSignature and htmlSignature; its
+// email is the IMAP login and it cannot be destroyed. Any other identity is
+// the account's own: created with whatever address the client names, since
+// the MTA is the one place that knows which senders a login may use and it
+// enforces that on MAIL FROM regardless of what the proxy accepts.
 export async function identitySet(
   args: IdentitySetArgs,
   ctx: { account: AccountRow; store: Store },
@@ -95,51 +112,128 @@ export async function identitySet(
     throw new JmapError("stateMismatch", "ifInState does not match current Identity state");
   }
   const id = singletonId(ctx.account.id);
+  const extras = extraIdentities(ctx.store, ctx.account.id);
+  let extrasTouched = false;
+
+  const created: Record<string, { id: string; mayDelete: boolean }> = {};
   const notCreated: Record<string, SetError> = {};
-  for (const tempId of Object.keys(args.create ?? {})) {
-    notCreated[tempId] = {
-      type: "forbidden",
-      description: "Identity is a singleton derived from the account credentials",
-    };
+  for (const [tempId, raw] of Object.entries(args.create ?? {})) {
+    try {
+      const extra = parseExtraIdentity(raw);
+      const newId = `${id}-${randomUUID().slice(0, 8)}`;
+      extras[newId] = extra;
+      extrasTouched = true;
+      created[tempId] = { id: newId, mayDelete: true };
+    } catch (e) {
+      notCreated[tempId] = toSetError(e);
+    }
   }
+
   const notUpdated: Record<string, SetError> = {};
   const updated: Record<string, null> = {};
-  let mutated = false;
   for (const [target, patch] of Object.entries(args.update ?? {})) {
-    if (target !== id) {
-      notUpdated[target] = { type: "notFound" };
-      continue;
-    }
     try {
-      applyIdentityPatch(ctx, patch);
+      if (target === id) {
+        applyIdentityPatch(ctx, patch);
+      } else if (extras[target]) {
+        extras[target] = applyExtraPatch(extras[target], patch);
+        extrasTouched = true;
+      } else {
+        notUpdated[target] = { type: "notFound" };
+        continue;
+      }
       updated[target] = null;
-      mutated = true;
     } catch (e) {
       notUpdated[target] = toSetError(e);
     }
   }
+
+  const destroyed: string[] = [];
   const notDestroyed: Record<string, SetError> = {};
   for (const target of args.destroy ?? []) {
-    notDestroyed[target] = { type: "forbidden", description: "Identity may not be destroyed" };
+    if (target === id) {
+      notDestroyed[target] = { type: "forbidden", description: "Identity may not be destroyed" };
+    } else if (extras[target]) {
+      delete extras[target];
+      extrasTouched = true;
+      destroyed.push(target);
+    } else {
+      notDestroyed[target] = { type: "notFound" };
+    }
   }
 
-  if (mutated) {
-    ctx.store.recordChanges(ctx.account.id, "identity", {
-      updated: Object.keys(updated),
-    });
-  }
+  if (extrasTouched) ctx.store.setPref(ctx.account.id, PREF_IDENTITIES, extras);
+  ctx.store.recordChanges(ctx.account.id, "identity", {
+    created: Object.values(created).map((c) => c.id),
+    updated: Object.keys(updated),
+    destroyed,
+  });
 
   return {
     accountId: args.accountId,
     oldState,
     newState: identityState(ctx.store, ctx.account.id),
-    created: null,
+    created: Object.keys(created).length ? created : null,
     notCreated: Object.keys(notCreated).length ? notCreated : null,
     updated: Object.keys(updated).length ? updated : null,
     notUpdated: Object.keys(notUpdated).length ? notUpdated : null,
-    destroyed: null,
+    destroyed: destroyed.length ? destroyed : null,
     notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
   };
+}
+
+/** A full identity from a create body: email required, the rest optional. */
+function parseExtraIdentity(raw: Record<string, unknown>): ExtraIdentity {
+  if (!raw || typeof raw !== "object") throw new JmapError("invalidProperties", "create entry must be an object");
+  const email = typeof raw["email"] === "string" ? raw["email"].trim() : "";
+  if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
+    throw new JmapError("invalidProperties", "email must be an email address", { properties: ["email"] });
+  }
+  const base: ExtraIdentity = { name: "", email, replyTo: null, bcc: null, textSignature: "", htmlSignature: "" };
+  const { email: _e, ...rest } = raw;
+  return applyExtraPatch(base, rest);
+}
+
+function applyExtraPatch(cur: ExtraIdentity, patch: Record<string, unknown>): ExtraIdentity {
+  const next = { ...cur };
+  for (const [k, v] of Object.entries(patch)) {
+    switch (k) {
+      case "name":
+      case "textSignature":
+      case "htmlSignature":
+        if (v != null && typeof v !== "string") {
+          throw new JmapError("invalidProperties", `${k} must be a string`, { properties: [k] });
+        }
+        next[k] = (v as string | null) ?? "";
+        break;
+      case "replyTo":
+      case "bcc":
+        next[k] = parseAddressList(v, k);
+        break;
+      case "email":
+        // Immutable per RFC 8621 §6.1; the same value echoed back is fine.
+        if (v !== cur.email) throw new JmapError("invalidProperties", "email is immutable", { properties: [k] });
+        break;
+      case "id":
+      case "mayDelete":
+        break;
+      default:
+        throw new JmapError("invalidProperties", `unknown property: ${k}`, { properties: [k] });
+    }
+  }
+  return next;
+}
+
+function parseAddressList(v: unknown, k: string): { name?: string | null; email: string }[] | null {
+  if (v == null) return null;
+  if (!Array.isArray(v)) throw new JmapError("invalidProperties", `${k} must be an array or null`, { properties: [k] });
+  return v.map((entry) => {
+    const e = entry as { name?: string | null; email?: unknown };
+    if (typeof e.email !== "string") {
+      throw new JmapError("invalidProperties", `${k}[].email is required`, { properties: [k] });
+    }
+    return { name: e.name ?? null, email: e.email };
+  });
 }
 
 function applyIdentityPatch(
@@ -169,27 +263,11 @@ function applyIdentityPatch(
         next.htmlSignature = (v as string | null) ?? null;
         break;
       case "replyTo":
-        if (v == null) {
-          next.replyTo = null;
-        } else if (Array.isArray(v)) {
-          next.replyTo = v.map((entry) => {
-            const e = entry as { name?: string | null; email?: unknown };
-            if (typeof e.email !== "string") {
-              throw new JmapError("invalidProperties", "replyTo[].email is required", {
-                properties: [k],
-              });
-            }
-            return { name: e.name ?? null, email: e.email };
-          });
-        } else {
-          throw new JmapError("invalidProperties", "replyTo must be an array or null", {
-            properties: [k],
-          });
-        }
+        next.replyTo = parseAddressList(v, k);
         break;
       case "email":
         // Server-derived; per RFC 8621 §6.1 changes are not allowed.
-        if (v !== ctx.account.username) {
+        if (v !== deriveIdentityEmail(ctx.account)) {
           throw new JmapError("invalidProperties", "email is server-controlled", {
             properties: [k],
           });
