@@ -32,6 +32,7 @@ import { applyPatch } from "./contacts.js";
 import { readBlob } from "../blobs.js";
 import { planScheduling, sendScheduling, type ImipMessage } from "../../caldav/imip.js";
 import { log } from "../../util/log.js";
+import { DEFAULT_COLLECTION, davFlavor } from "../../util/dav-flavor.js";
 
 export interface CalendarCtx {
   account: AccountRow;
@@ -191,7 +192,7 @@ function eventCalendars(cals: CalendarInfo[]): CalendarInfo[] {
 /**
  * The calendar flagged isDefault and used when an event is created without a
  * calendarIds. The account's stored choice wins as long as that calendar still
- * exists; otherwise the `calendar` collection (the one a fresh account gets),
+ * exists; otherwise the collection the server sets up for a new account (per DAV flavor),
  * otherwise the first by href. The server lists collections in directory
  * order, so nothing here relies on the order of the PROPFIND response.
  */
@@ -200,7 +201,8 @@ function defaultCalendar(ctx: CalendarCtx, cals: CalendarInfo[]): CalendarInfo |
   const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_CALENDAR);
   const chosen = pref ? cals.find((c) => calendarId(c.href) === pref) : undefined;
   if (chosen) return chosen;
-  return cals.find((c) => leaf(c.href) === DEFAULT_CALENDAR_SLUG) ?? [...cals].sort((a, b) => a.href.localeCompare(b.href))[0];
+  const slug = DEFAULT_COLLECTION[davFlavor(ctx.provider.caldav)].calendar;
+  return cals.find((c) => leaf(c.href) === slug) ?? [...cals].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 export async function calendarGet(

@@ -1,6 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 
+/**
+ * The DAV server implementation behind a carddav / caldav block. It decides
+ * the few things the RFCs leave open: what the default collections are
+ * called and which vCard forms the server stores intact. `generic` sticks
+ * to the RFCs.
+ */
+export type DavFlavor = "generic" | "radicale" | "nextcloud" | "stalwart";
+export const DAV_FLAVORS: readonly DavFlavor[] = ["generic", "radicale", "nextcloud", "stalwart"];
+
 export interface ProviderConfig {
   /**
    * Email domains served by this provider. When a client authenticates with a
@@ -19,6 +28,7 @@ export interface ProviderConfig {
     secure?: boolean;
     basePath?: string;
     principalPath?: string;
+    flavor?: DavFlavor;
   } | null;
   /**
    * CalDAV server backing JMAP for Calendars. Same shape as `carddav`; the
@@ -31,6 +41,7 @@ export interface ProviderConfig {
     secure?: boolean;
     basePath?: string;
     principalPath?: string;
+    flavor?: DavFlavor;
   } | null;
   auth: { mech: string[] };
 }
@@ -75,6 +86,14 @@ export function loadConfig(): AppConfig {
   let providers: Record<string, ProviderConfig> = {};
   if (fs.existsSync(providersFile)) {
     providers = JSON.parse(fs.readFileSync(providersFile, "utf8"));
+    for (const [name, p] of Object.entries(providers)) {
+      for (const block of ["carddav", "caldav"] as const) {
+        const flavor = p[block]?.flavor;
+        if (flavor !== undefined && !DAV_FLAVORS.includes(flavor)) {
+          throw new Error(`providers.${name}.${block}.flavor: "${flavor}" is not one of ${DAV_FLAVORS.join(", ")}`);
+        }
+      }
+    }
   }
 
   return {
