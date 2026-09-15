@@ -359,8 +359,8 @@ describe("RFC 9555 mapping", () => {
     expect(flat).toContain("ORG-DIRECTORY;PROP-ID=d0:ldap://ldap.example/o=EuroTech");
     expect(flat).toContain("CONTACT-URI;PROP-ID=l1:https://example.test/contact");
     expect(flat).toContain("RELATED;TYPE=spouse:urn:uuid:paul");
-    // Inline base64 goes out as ENCODING=b binary, the only form vobject (Radicale) keeps whole.
-    expect(flat).toContain("PHOTO;PROP-ID=m0;ENCODING=b;MEDIATYPE=image/jpeg:/9j/4AAQSkZJRg==");
+    // Inline base64 goes out as a data: URI unless the flavor says otherwise.
+    expect(flat).toContain(`PHOTO;PROP-ID=m0:${JPEG}`);
 
     const [back] = parseVCards(text);
     expect(back!.language).toBe("fr");
@@ -440,13 +440,37 @@ describe("RFC 9555 mapping", () => {
     expect(edited).not.toContain("CALADRURI");
   });
 
-  it("escapes commas in URI values and inlines a data: LOGO or KEY as ENCODING=b, the forms vobject keeps whole", () => {
-    const text = serializeVCard({
+  it("writes RFC 6350 forms by default: data: URIs as is, URIs unescaped", () => {
+    const card = {
       uid: "1",
       links: { l0: { uri: "https://x.test/a,b" } },
-      media: { m0: { kind: "logo", uri: "data:image/png;base64,iVBORw0KGgo=" } },
+      media: { m0: { kind: "logo" as const, uri: "data:image/png;base64,iVBORw0KGgo=" }, m1: { kind: "photo" as const, uri: "https://x.test/me.jpg", mediaType: "image/jpeg" } },
       cryptoKeys: { k0: { uri: "data:application/pgp-keys;base64,aGVsbG8=" } },
-    });
+    };
+    for (const flavor of [undefined, "generic", "nextcloud", "stalwart"] as const) {
+      const text = serializeVCard(card, { flavor });
+      expect(text).toContain("URL;PROP-ID=l0:https://x.test/a,b");
+      expect(text).toContain("LOGO;PROP-ID=m0:data:image/png;base64,iVBORw0KGgo=");
+      expect(text).toContain("PHOTO;PROP-ID=m1;MEDIATYPE=image/jpeg:https://x.test/me.jpg");
+      expect(text).toContain("KEY;PROP-ID=k0:data:application/pgp-keys;base64,aGVsbG8=");
+      expect(text).not.toContain("ENCODING=b");
+      const [back] = parseVCards(text);
+      expect(back!.links?.l0?.uri).toBe("https://x.test/a,b");
+      expect(back!.media?.m0).toEqual({ kind: "logo", uri: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" });
+      expect(back!.media?.m1).toEqual({ kind: "photo", uri: "https://x.test/me.jpg", mediaType: "image/jpeg" });
+    }
+  });
+
+  it("for radicale escapes commas in URI values and inlines data: media as ENCODING=b, the forms vobject keeps whole", () => {
+    const text = serializeVCard(
+      {
+        uid: "1",
+        links: { l0: { uri: "https://x.test/a,b" } },
+        media: { m0: { kind: "logo", uri: "data:image/png;base64,iVBORw0KGgo=" } },
+        cryptoKeys: { k0: { uri: "data:application/pgp-keys;base64,aGVsbG8=" } },
+      },
+      { flavor: "radicale" },
+    );
     expect(text).toContain("URL;PROP-ID=l0:https://x.test/a\\,b");
     expect(text).toContain("LOGO;PROP-ID=m0;ENCODING=b;MEDIATYPE=image/png:iVBORw0KGgo=");
     expect(text).toContain("KEY;PROP-ID=k0;ENCODING=b;MEDIATYPE=application/pgp-keys:aGVsbG8=");

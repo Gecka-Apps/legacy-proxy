@@ -371,10 +371,19 @@ template. A `null` (or absent) `sieve`, `carddav` or `caldav` is allowed; the
 corresponding capability is then not advertised and the JMAP methods either
 return empty results or, for vacation, reject with the underlying ManageSieve
 error. `carddav` and `caldav` share the same shape (`host`, `port`, `secure`,
-`basePath`, optional `principalPath`) and usually point at the same server —
-Radicale, Baïkal, SOGo, Nextcloud, Stalwart… The DAV backend must accept the
-user's IMAP credentials: the proxy replays them (Radicale's
-`[auth] type = dovecot` or `imap` does exactly that). An optional `domains` array on a provider
+`basePath`, optional `principalPath` and `flavor`) and usually point at the
+same server. The DAV backend must accept the user's IMAP credentials: the
+proxy replays them (Radicale's `[auth] type = dovecot` or `imap` does exactly
+that, Nextcloud with an LDAP backend shared with the mail server too).
+`flavor` names the implementation, `generic` (the default), `radicale`,
+`nextcloud` or `stalwart`, and settles what the RFCs leave open: the
+collection a new account gets, taken as the default one until the account
+picks another (`contacts` and `calendar`, `contacts` and `personal`,
+`default` and `default`), and the vCard forms the server stores intact.
+Radicale rewrites every card through vobject, which cuts a value at its first
+unescaped comma, so `radicale` text-escapes URIs and writes inline photos,
+logos, sounds and keys as `ENCODING=b` binaries; the other flavors get the
+plain RFC 6350 forms. An optional `domains` array on a provider
 opts it into domain-based [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 

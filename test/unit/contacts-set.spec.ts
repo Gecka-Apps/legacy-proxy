@@ -34,6 +34,12 @@ const PRINCIPAL = "/principals/u/";
 
 class FakeDav {
   books = new Map<string, Book>();
+  /**
+   * Mimic a server that rewrites cards through vobject (Radicale): a single
+   * value is cut at its first unescaped comma, ENCODING=b binaries and the
+   * list-valued CATEGORIES go through whole.
+   */
+  vobject = false;
   calls: Array<{ method: string; path: string; headers: Record<string, string>; body: string }> = [];
   private etagSeq = 0;
 
@@ -153,6 +159,7 @@ class FakeDav {
     }
     if (!/^text\/vcard/.test(headers["content-type"] ?? "")) return new Response("type", { status: 415 });
     if (!/BEGIN:VCARD/.test(body) || !/\r\nUID:/.test(body)) return new Response("bad vcard", { status: 400 });
+    if (this.vobject) body = vobjectRewrite(body);
     const etag = this.nextEtag();
     book.resources.set(path, { data: body, etag });
     return new Response(null, { status: existing ? 204 : 201, headers: { etag } });
@@ -195,6 +202,27 @@ class FakeDav {
   }
 }
 
+function vobjectRewrite(text: string): string {
+  const out: string[] = [];
+  for (const line of text.replace(/\r\n[ \t]/g, "").split("\r\n")) {
+    let colon = -1;
+    for (let i = 0, q = false; i < line.length; i++) {
+      if (line[i] === '"') q = !q;
+      else if (line[i] === ":" && !q) { colon = i; break; }
+    }
+    const head = colon < 0 ? line : line.slice(0, colon);
+    const name = head.split(";")[0]!.replace(/^[^.]*\./, "").toUpperCase();
+    if (colon < 0 || name === "CATEGORIES" || /;ENCODING=b/i.test(head)) {
+      out.push(line);
+      continue;
+    }
+    const value = line.slice(colon + 1);
+    const cut = value.search(/(?<!\\),/);
+    out.push(cut < 0 ? line : `${head}:${value.slice(0, cut)}`);
+  }
+  return out.join("\r\n");
+}
+
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -208,7 +236,7 @@ const provider: ProviderConfig = {
   imap: { host: "imap.test", port: 993 },
   smtp: { host: "smtp.test", port: 465 },
   sieve: null,
-  carddav: { host: "dav.test", port: 443, secure: true, basePath: "/" },
+  carddav: { host: "dav.test", port: 443, secure: true, basePath: "/", flavor: "radicale" },
   auth: { mech: ["PLAIN"] },
 };
 
@@ -243,6 +271,7 @@ beforeEach(() => {
   // cross-instance discovery/book caches must be cleared with it.
   resetCardDavCaches();
   dav = new FakeDav();
+  dav.vobject = true;
   ctx = {
     account: { id: 7, username: "u" } as AccountRow,
     provider,
@@ -522,6 +551,49 @@ describe("ContactCard/set", () => {
 });
 
 // -- AddressBook/set ------------------------------------------------------------
+
+describe("DAV flavor", () => {
+  const JPEG = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+  const card = {
+    name: { full: "Photo, Test" },
+    media: { m0: { kind: "photo", uri: JPEG, mediaType: "image/jpeg" } },
+    links: { l0: { uri: "https://x.test/a,b" } },
+  };
+
+  it("radicale: photo and URIs survive a server that cuts values at the first comma", async () => {
+    dav.addBook("contacts", "Contacts");
+    const res = await contactCardSet({ accountId: "7", create: { c: card } }, ctx);
+    expect(res.notCreated).toBeNull();
+    const put = dav.calls.find((c) => c.method === "PUT")!;
+    expect(put.body.replace(/\r\n /g, "")).toContain("PHOTO;PROP-ID=m0;ENCODING=b;MEDIATYPE=image/jpeg:/9j/4AAQSkZJRg==");
+    const got = await contactCardGet({ accountId: "7", ids: [res.created!["c"]!.id] }, ctx);
+    expect(got.list[0]).toMatchObject({ name: { full: "Photo, Test" }, media: { m0: { kind: "photo", uri: JPEG } }, links: { l0: { uri: "https://x.test/a,b" } } });
+  });
+
+  it("nextcloud: the RFC 6350 forms go out and the default calendar slug differs", async () => {
+    dav.vobject = false;
+    ctx = { ...ctx, provider: { ...provider, carddav: { ...provider.carddav!, flavor: "nextcloud" } } };
+    dav.addBook("contacts", "Contacts");
+    const res = await contactCardSet({ accountId: "7", create: { c: card } }, ctx);
+    expect(res.notCreated).toBeNull();
+    const put = dav.calls.find((c) => c.method === "PUT")!;
+    const flat = put.body.replace(/\r\n /g, "");
+    expect(flat).toContain(`PHOTO;PROP-ID=m0:${JPEG}`);
+    expect(flat).toContain("URL;PROP-ID=l0:https://x.test/a,b");
+    expect(flat).not.toContain("ENCODING=b");
+    const got = await contactCardGet({ accountId: "7", ids: [res.created!["c"]!.id] }, ctx);
+    expect(got.list[0]).toMatchObject({ media: { m0: { kind: "photo", uri: JPEG } }, links: { l0: { uri: "https://x.test/a,b" } } });
+  });
+
+  it("stalwart: the `default` collection is the default address book", async () => {
+    dav.vobject = false;
+    ctx = { ...ctx, provider: { ...provider, carddav: { ...provider.carddav!, flavor: "stalwart" } } };
+    dav.addBook("contacts", "Contacts");
+    dav.addBook("default", "Stalwart Address Book");
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Stalwart Address Book");
+  });
+});
 
 describe("AddressBook/set", () => {
   it("creates a collection with extended MKCOL and returns server-set props", async () => {

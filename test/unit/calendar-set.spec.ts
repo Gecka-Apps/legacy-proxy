@@ -325,6 +325,16 @@ describe("default calendar", () => {
     ]);
   });
 
+  it("is `personal` on nextcloud and `default` on stalwart", async () => {
+    dav.addCalendar("calendar", "Calendar");
+    dav.addCalendar("personal", "Personal");
+    dav.addCalendar("default", "Stalwart Calendar");
+    const on = (flavor: "nextcloud" | "stalwart") => ({ ...ctx, provider: { ...provider, caldav: { ...provider.caldav!, flavor } } });
+    expect((await calendarGet({ accountId: "7", ids: null }, ctx)).list.find((c) => c.isDefault)?.name).toBe("Calendar");
+    expect((await calendarGet({ accountId: "7", ids: null }, on("nextcloud"))).list.find((c) => c.isDefault)?.name).toBe("Personal");
+    expect((await calendarGet({ accountId: "7", ids: null }, on("stalwart"))).list.find((c) => c.isDefault)?.name).toBe("Stalwart Calendar");
+  });
+
   it("falls back to the first href in sorted order, never a VTODO-only collection", async () => {
     dav.addCalendar("zeta", "Zeta");
     dav.addCalendar("alpha", "Alpha");

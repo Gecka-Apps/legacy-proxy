@@ -11,8 +11,8 @@
     "imap": { "host": "$IMAP_HOST", "port": 993, "secure": true },
     "smtp": { "host": "$SMTP_HOST", "port": 587, "starttls": true },
     "sieve": { "host": "$SIEVE_HOST", "port": 4190, "starttls": true },
-    "carddav": { "host": "$CARDDAV_HOST", "port": 443, "secure": true, "basePath": "/.well-known/carddav" },
-    "caldav": { "host": "$CALDAV_HOST", "port": 443, "secure": true, "basePath": "/.well-known/caldav" },
+    "carddav": { "host": "$CARDDAV_HOST", "port": 443, "secure": true, "basePath": "/.well-known/carddav", "flavor": "generic" },
+    "caldav": { "host": "$CALDAV_HOST", "port": 443, "secure": true, "basePath": "/.well-known/caldav", "flavor": "generic" },
     "auth": { "mech": ["PLAIN", "LOGIN"] }
   }
 }
