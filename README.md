@@ -137,7 +137,7 @@ Backends:
   PROPFIND / `addressbook-multiget`; writes are `PUT` with `If-None-Match: *`
   (create) or `If-Match` (update), `DELETE`, extended `MKCOL` (RFC 5689) and
   `PROPPATCH`. Cards are re-serialised as vCard 4.0 on update; properties the
-  JSContact projection doesn't model (PHOTO, IMPP, X-*, …) are carried over
+  JSContact projection doesn't model (X-*, GEO, TZ, …) are carried over
   untouched.
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
@@ -203,14 +203,19 @@ Sort and filter:
   handler is registered, so the capability is not advertised).
 - CardDAV cards live in exactly one collection, so `ContactCard/set` rejects
   `addressBookIds` changes (moving a card between books) with
-  `invalidProperties`. `AddressBook/set` only persists `name` and
-  `description`; `isDefault`, `sortOrder`, `isSubscribed` and `color` have no
+  `invalidProperties`. `AddressBook/set` persists `name` and `description`
+  on the collection and the default book (`onSuccessSetIsDefault`) in the
+  proxy's preference table; `sortOrder`, `isSubscribed` and `color` have no
   CardDAV equivalent and are accepted but ignored. No sharing (`shareWith`).
-- The JSContact ⇄ vCard translation covers name, nicknames, emails, phones,
-  organisations, titles, addresses, notes, links, anniversaries, kind and
-  group members. Other JSContact properties sent on create (media,
-  onlineServices, …) are dropped; on update the corresponding vCard lines
-  are preserved as-is.
+- The JSContact ⇄ vCard translation follows RFC 9555: name, nicknames,
+  emails, phones, online services, preferred languages, organisations,
+  titles, addresses, anniversaries, personal info, notes, media (photo, logo,
+  sound), crypto keys, directories, links, calendar and scheduling URIs,
+  related cards, keywords, pronouns and grammatical gender, kind and group
+  members. Object keys travel in `PROP-ID`, labels and title/organisation
+  links ride on vCard property groups, and the JSContact values vCard has no
+  property for (`kind: "other"`) go through `JSPROP`. Name and address
+  ordering hints (`isOrdered`, `defaultSeparator`) are not stored.
 - Multi-mailbox membership: an Email lives in exactly one IMAP folder. JMAP
   operations that try to add or remove a mailbox membership treat the move as
   a copy + expunge, which produces a new id rather than preserving the old
