@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { addressBookGet, contactCardSet, type ContactCtx } from "../../src/jmap/methods/contacts.js";
 import { cardDavLimits, resetCardDavCaches } from "../../src/carddav/client.js";
-import type { AccountRow } from "../../src/state/store.js";
+import type { AccountRow, Store } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 
 const BOOK = "/books/u/contacts/";
@@ -47,6 +47,7 @@ beforeAll(async () => {
       auth: { mech: ["PLAIN"] },
     } as ProviderConfig,
     creds: { mech: "PLAIN", username: "u", password: "p" },
+    store: { getPref: () => null, setPref: () => {}, deletePref: () => {} } as unknown as Store,
   };
 });
 beforeEach(() => {

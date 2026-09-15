@@ -19,7 +19,7 @@ import { CardDavClient, davOptions, CardDavConflict, type AddressBookInfo } from
 import { parseVCards, serializeVCard, type JsContact } from "../../carddav/vcard.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
-import type { AccountRow } from "../../state/store.js";
+import type { AccountRow, Store } from "../../state/store.js";
 import { accountNotFound, JmapError } from "../errors.js";
 import { log } from "../../util/log.js";
 
@@ -27,6 +27,7 @@ export interface ContactCtx {
   account: AccountRow;
   provider: ProviderConfig;
   creds: Credentials;
+  store: Store;
 }
 
 interface AddressBookJson {
@@ -99,16 +100,34 @@ function splitCardId(id: string): { bookHref: string; resourceHref: string } | n
   }
 }
 
-function projectAddressBook(b: AddressBookInfo, isFirst: boolean): AddressBookJson {
+function projectAddressBook(b: AddressBookInfo, isDefault: boolean): AddressBookJson {
   return {
     id: bookId(b.href),
     name: b.displayName,
     description: b.description,
     sortOrder: 0,
-    isDefault: isFirst,
+    isDefault,
     isSubscribed: true,
     myRights: { mayRead: true, mayWrite: true, mayShare: false, mayDelete: true },
   };
+}
+
+const PREF_DEFAULT_BOOK = "addressbook:default";
+
+/**
+ * The book flagged isDefault and used when a card is created without an
+ * addressBookIds. The account's stored choice wins as long as that book still
+ * exists; otherwise the `contacts` collection (the one a fresh account gets),
+ * otherwise the first by href. CardDAV has no default-book property and the
+ * server lists collections in directory order, so nothing here relies on the
+ * order of the PROPFIND response.
+ */
+function defaultBook(ctx: ContactCtx, books: AddressBookInfo[]): AddressBookInfo | undefined {
+  if (books.length === 0) return undefined;
+  const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_BOOK);
+  const chosen = pref ? books.find((b) => bookId(b.href) === pref) : undefined;
+  if (chosen) return chosen;
+  return books.find((b) => leaf(b.href) === DEFAULT_BOOK_SLUG) ?? [...books].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 function bookState(b: AddressBookInfo): string {
@@ -134,7 +153,8 @@ export async function addressBookGet(
 
   const client = makeClient(ctx);
   const books = await client.listAddressBooks();
-  const projected = books.map((b, i) => projectAddressBook(b, i === 0));
+  const def = defaultBook(ctx, books);
+  const projected = books.map((b) => projectAddressBook(b, b === def));
   const list = args.ids ? projected.filter((b) => args.ids!.includes(b.id)) : projected;
   const notFound = args.ids ? args.ids.filter((id) => !projected.some((b) => b.id === id)) : [];
   return { accountId: args.accountId, state: combinedState(books), list, notFound };
@@ -301,7 +321,8 @@ interface SetResponse<Created> {
   oldState: string;
   newState: string;
   created: Record<string, Created> | null;
-  updated: Record<string, null> | null;
+  /** Server-set properties that changed as a side effect, or null when none. */
+  updated: Record<string, Record<string, unknown> | null> | null;
   destroyed: string[] | null;
   notCreated: Record<string, SetError> | null;
   notUpdated: Record<string, SetError> | null;
@@ -367,22 +388,23 @@ function stripAtType(o: unknown): void {
   for (const v of Object.values(r)) stripAtType(v);
 }
 
-/** Pick the (single) address book a card should live in. */
+/** Pick the (single) address book a card should live in, `fallback` when the client names none. */
 function resolveBook(
   books: AddressBookInfo[],
+  fallback: AddressBookInfo | undefined,
   addressBookIds: unknown,
 ): { book: AddressBookInfo } | { error: SetError } {
-  if (books.length === 0) {
+  if (books.length === 0 || !fallback) {
     return { error: setError("invalidProperties", "no address book exists on the CardDAV server", ["addressBookIds"]) };
   }
-  if (addressBookIds == null) return { book: books[0]! };
+  if (addressBookIds == null) return { book: fallback };
   if (typeof addressBookIds !== "object") {
     return { error: setError("invalidProperties", "addressBookIds must be an object", ["addressBookIds"]) };
   }
   const ids = Object.entries(addressBookIds as Record<string, unknown>)
     .filter(([, on]) => on === true)
     .map(([id]) => id);
-  if (ids.length === 0) return { book: books[0]! };
+  if (ids.length === 0) return { book: fallback };
   if (ids.length > 1) {
     return { error: setError("invalidProperties", "a CardDAV card can only live in one address book", ["addressBookIds"]) };
   }
@@ -425,7 +447,7 @@ export async function contactCardSet(
         // materialise one rather than bounce the very first contact.
         books = [await ensureDefaultBook(client)];
       }
-      const picked = resolveBook(books, input["addressBookIds"]);
+      const picked = resolveBook(books, defaultBook(ctx, books), input["addressBookIds"]);
       if ("error" in picked) {
         (out.notCreated ??= {})[tempId] = picked.error;
         continue;
@@ -560,7 +582,7 @@ const BOOK_WRITABLE = new Set(["name", "description"]);
 const BOOK_IGNORED = new Set(["isSubscribed", "sortOrder", "isDefault", "color"]);
 
 export async function addressBookSet(
-  args: SetArgs & { onDestroyRemoveContents?: boolean },
+  args: SetArgs & { onDestroyRemoveContents?: boolean; onSuccessSetIsDefault?: string | null },
   ctx: ContactCtx,
 ): Promise<SetResponse<Omit<AddressBookJson, "name">>> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
@@ -568,6 +590,7 @@ export async function addressBookSet(
   let books = await client.listAddressBooks();
   const oldState = combinedState(books);
   if (args.ifInState != null && args.ifInState !== oldState) throw new JmapError("stateMismatch");
+  const previousDefault = defaultBook(ctx, books);
 
   const out: SetResponse<Omit<AddressBookJson, "name">> = {
     accountId: args.accountId,
@@ -600,10 +623,10 @@ export async function addressBookSet(
       const href = `${home}${collectionSlug(name, books)}/`;
       await client.makeAddressBook(href, { displayName: name, description });
       const info: AddressBookInfo = { href, displayName: name, description, ctag: null };
-      const projected = projectAddressBook(info, books.length === 0);
+      books = [...books, info];
+      const projected = projectAddressBook(info, defaultBook(ctx, books) === info);
       const { name: _n, ...serverSet } = projected;
       (out.created ??= {})[tempId] = serverSet;
-      books = [...books, info];
     } catch (e) {
       log.warn({ err: (e as Error).message, tempId }, "AddressBook/set create failed");
       (out.notCreated ??= {})[tempId] = errorFor(e, "invalidProperties");
@@ -671,6 +694,32 @@ export async function addressBookSet(
   if (out.created || out.updated || out.destroyed) {
     books = await client.listAddressBooks();
     out.newState = combinedState(books);
+  }
+
+  // RFC 9610 §2.3: applied only when every create, update and destroy went
+  // through; an id that matches nothing is ignored, not an error. A `#tempId`
+  // names a book created above. The books whose isDefault flips are reported
+  // back with the server-set value.
+  if (args.onSuccessSetIsDefault != null && !out.notCreated && !out.notUpdated && !out.notDestroyed) {
+    let wanted = args.onSuccessSetIsDefault;
+    let createdAs: string | null = null;
+    if (wanted.startsWith("#")) {
+      createdAs = wanted.slice(1);
+      wanted = out.created?.[createdAs]?.id ?? "";
+    }
+    const target = books.find((b) => bookId(b.href) === wanted);
+    if (target) {
+      ctx.store.setPref(ctx.account.id, PREF_DEFAULT_BOOK, wanted);
+      const created = createdAs ? out.created?.[createdAs] : undefined;
+      if (created) {
+        created.isDefault = true;
+      } else if (previousDefault?.href !== target.href) {
+        (out.updated ??= {})[wanted] = { isDefault: true };
+      }
+      if (previousDefault && previousDefault.href !== target.href && books.some((b) => b.href === previousDefault.href)) {
+        (out.updated ??= {})[bookId(previousDefault.href)] = { isDefault: false };
+      }
+    }
   }
   return out;
 }

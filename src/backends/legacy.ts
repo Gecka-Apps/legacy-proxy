@@ -111,17 +111,17 @@ function makeMethodTable(): Record<string, Handler> {
         };
       }
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return addressBookGet(a as never, { account: c.account, provider, creds });
+      return addressBookGet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "AddressBook/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return addressBookSet(a as never, { account: c.account, provider, creds });
+      return addressBookSet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "AddressBook/changes": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return addressBookChanges(a as never, { account: c.account, provider, creds });
+      return addressBookChanges(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "ContactCard/get": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
@@ -134,7 +134,7 @@ function makeMethodTable(): Record<string, Handler> {
         };
       }
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return contactCardGet(a as never, { account: c.account, provider, creds });
+      return contactCardGet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "ContactCard/query": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
@@ -149,22 +149,22 @@ function makeMethodTable(): Record<string, Handler> {
         };
       }
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return contactCardQuery(a as never, { account: c.account, provider, creds });
+      return contactCardQuery(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "ContactCard/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return contactCardSet(a as never, { account: c.account, provider, creds });
+      return contactCardSet(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "ContactCard/changes": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return contactCardChanges(a as never, { account: c.account, provider, creds });
+      return contactCardChanges(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "ContactCard/queryChanges": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
+      return contactCardQueryChanges(a as never, { account: c.account, provider, creds, store: c.store });
     },
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
