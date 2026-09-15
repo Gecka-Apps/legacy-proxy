@@ -277,7 +277,7 @@ function mediaUri(p: ParsedLine, fallbackType: string): { uri: string; mediaType
   const value = p.value.trim();
   const encoding = (param(p, "ENCODING") ?? "").toLowerCase();
   if (encoding === "b" || encoding === "base64") {
-    const type = typeValues(p).find((t) => t !== "pref") ?? "";
+    const type = param(p, "MEDIATYPE") ?? typeValues(p).find((t) => t !== "pref") ?? "";
     const mime = type.includes("/") ? type : type ? `${fallbackType}/${type}` : fallbackType;
     return { uri: `data:${mime};base64,${value.replace(/\s+/g, "")}`, mediaType: mime };
   }
@@ -941,13 +941,13 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     const params: Params = { "PROP-ID": propId(key), TYPE: contextTypes(s.contexts), PREF: prefParam(s.pref) };
     if (asImpp) {
       if (s.service) params["X-SERVICE-TYPE"] = [s.service];
-      push("IMPP", params, uriValue(s.uri ?? s.user!), g);
+      push("IMPP", params, escapeValue(s.uri ?? s.user!), g);
       continue;
     }
     if (s.service) params["SERVICE-TYPE"] = [s.service];
     if (s.uri) {
       if (s.user) params["USERNAME"] = [s.user];
-      push("SOCIALPROFILE", params, uriValue(s.uri), g);
+      push("SOCIALPROFILE", params, escapeValue(s.uri), g);
     } else {
       params["VALUE"] = ["text"];
       push("SOCIALPROFILE", params, escapeValue(s.user!), g);
@@ -1015,7 +1015,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     push(
       l.kind === "contact" ? "CONTACT-URI" : "URL",
       { "PROP-ID": propId(key), TYPE: contextTypes(l.contexts), PREF: prefParam(l.pref), MEDIATYPE: l.mediaType ? [l.mediaType] : undefined },
-      uriValue(l.uri),
+      escapeValue(l.uri),
       g,
     );
   }
@@ -1023,16 +1023,15 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
   for (const [key, m] of Object.entries(c.media ?? {})) {
     if (!m?.uri) continue;
     const prop = m.kind === "logo" ? "LOGO" : m.kind === "sound" ? "SOUND" : "PHOTO";
-    // A data: URI names its own media type; MEDIATYPE is for the others.
-    const mediaType = m.mediaType && !/^data:/i.test(m.uri) ? [m.mediaType] : undefined;
     const g = labelled(m.label, null);
-    push(prop, { "PROP-ID": propId(key), TYPE: contextTypes(m.contexts), PREF: prefParam(m.pref), MEDIATYPE: mediaType }, uriValue(m.uri), g);
+    const params: Params = { "PROP-ID": propId(key), TYPE: contextTypes(m.contexts), PREF: prefParam(m.pref) };
+    push(prop, params, binaryValue(params, m.uri, m.mediaType, prop === "SOUND" ? "audio/basic" : "image/jpeg"), g);
   }
 
   for (const [key, k] of Object.entries(c.cryptoKeys ?? {})) {
     if (!k?.uri) continue;
-    const mediaType = k.mediaType && !/^data:/i.test(k.uri) ? [k.mediaType] : undefined;
-    push("KEY", { "PROP-ID": propId(key), TYPE: contextTypes(k.contexts), PREF: prefParam(k.pref), MEDIATYPE: mediaType }, uriValue(k.uri));
+    const params: Params = { "PROP-ID": propId(key), TYPE: contextTypes(k.contexts), PREF: prefParam(k.pref) };
+    push("KEY", params, binaryValue(params, k.uri, k.mediaType, "application/octet-stream"));
   }
 
   for (const [key, d] of Object.entries(c.directories ?? {})) {
@@ -1040,7 +1039,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     push(
       d.kind === "entry" ? "SOURCE" : "ORG-DIRECTORY",
       { "PROP-ID": propId(key), PREF: prefParam(d.pref), MEDIATYPE: d.mediaType ? [d.mediaType] : undefined, INDEX: d.listAs != null ? [String(d.listAs)] : undefined },
-      uriValue(d.uri),
+      escapeValue(d.uri),
     );
   }
 
@@ -1060,7 +1059,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     push(
       cal.kind === "freeBusy" ? "FBURL" : "CALURI",
       { "PROP-ID": key === "calendarUri" || key === "freeBusyUri" ? undefined : propId(key), TYPE: contextTypes(cal.contexts), PREF: prefParam(cal.pref), MEDIATYPE: cal.mediaType ? [cal.mediaType] : undefined },
-      uriValue(cal.uri),
+      escapeValue(cal.uri),
     );
   }
   const scheduling: NonNullable<JsContact["schedulingAddresses"]> = {};
@@ -1070,7 +1069,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     scheduling["schedulingUri"] = { uri: c.schedulingUri };
   }
   for (const [key, s] of Object.entries(scheduling)) {
-    push("CALADRURI", { "PROP-ID": key === "schedulingUri" ? undefined : propId(key), TYPE: contextTypes(s.contexts), PREF: prefParam(s.pref) }, uriValue(s.uri));
+    push("CALADRURI", { "PROP-ID": key === "schedulingUri" ? undefined : propId(key), TYPE: contextTypes(s.contexts), PREF: prefParam(s.pref) }, escapeValue(s.uri));
   }
 
   for (const [uri, r] of Object.entries(c.relatedTo ?? {})) {
@@ -1078,7 +1077,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
     const types = Object.entries(r?.relation ?? {})
       .filter(([, on]) => on)
       .map(([t]) => t);
-    push("RELATED", { TYPE: types }, uriValue(uri));
+    push("RELATED", { TYPE: types }, escapeValue(uri));
   }
 
   const keywords = Object.entries(c.keywords ?? {})
@@ -1119,7 +1118,7 @@ export function serializeVCard(c: JsContact, opts: SerializeOpts = {}): string {
   }
 
   for (const [uri, on] of Object.entries(c.members ?? {})) {
-    if (on && uri) push("MEMBER", {}, uriValue(uri));
+    if (on && uri) push("MEMBER", {}, escapeValue(uri));
   }
 
   push("REV", {}, opts.rev ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z"));
@@ -1219,7 +1218,30 @@ function addressFields(a: NonNullable<JsContact["addresses"]>[string]): string[]
   return fields;
 }
 
-/** RFC 6350 §3.4: escape backslash, comma, semicolon and newline in a text value. */
+/**
+ * Value of a PHOTO, LOGO, SOUND or KEY: an inline base64 `data:` URI goes
+ * out as ENCODING=b binary with its type in MEDIATYPE, any other URI as text.
+ * Radicale rewrites every card through vobject, which reads a property value
+ * as a text list and keeps only what precedes the first unescaped comma; a
+ * `data:` URI written as is comes back without its payload, while a base64
+ * payload flagged ENCODING=b is decoded and re-encoded intact.
+ */
+function binaryValue(params: Params, uri: string, mediaType: string | undefined, fallbackType: string): string {
+  const inline = /^data:([^;,]*)(?:;[^;,]*)*;base64,(.*)$/is.exec(uri);
+  if (inline) {
+    params["ENCODING"] = ["b"];
+    params["MEDIATYPE"] = [mediaType || inline[1] || fallbackType];
+    return inline[2]!.replace(/\s+/g, "");
+  }
+  if (mediaType) params["MEDIATYPE"] = [mediaType];
+  return escapeValue(uri);
+}
+
+/**
+ * RFC 6350 §3.4: escape backslash, comma, semicolon and newline in a text
+ * value. URI values get the same treatment: vobject, behind Radicale, cuts
+ * any value at its first unescaped comma, and clients unescape URIs anyway.
+ */
 export function escapeValue(v: string): string {
   return v
     .replace(/\\/g, "\\\\")
@@ -1231,14 +1253,6 @@ export function escapeValue(v: string): string {
 /** Like escapeValue, for one field of a structured (`;`-separated) value. */
 function escapeComponent(v: string): string {
   return escapeValue(v);
-}
-
-/**
- * A URI value goes out as is: RFC 6350 §3.4 escaping applies to TEXT values
- * only, and a `data:` URI escaped like text is unreadable to other clients.
- */
-function uriValue(v: string): string {
-  return v.replace(/[\r\n]/g, "");
 }
 
 function quoteParam(v: string): string {

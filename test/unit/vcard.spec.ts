@@ -359,8 +359,8 @@ describe("RFC 9555 mapping", () => {
     expect(flat).toContain("ORG-DIRECTORY;PROP-ID=d0:ldap://ldap.example/o=EuroTech");
     expect(flat).toContain("CONTACT-URI;PROP-ID=l1:https://example.test/contact");
     expect(flat).toContain("RELATED;TYPE=spouse:urn:uuid:paul");
-    // A data: URI is not TEXT: no escaping of its comma, and no MEDIATYPE duplicate.
-    expect(flat).toContain(`PHOTO;PROP-ID=m0:${JPEG}`);
+    // Inline base64 goes out as ENCODING=b binary, the only form vobject (Radicale) keeps whole.
+    expect(flat).toContain("PHOTO;PROP-ID=m0;ENCODING=b;MEDIATYPE=image/jpeg:/9j/4AAQSkZJRg==");
 
     const [back] = parseVCards(text);
     expect(back!.language).toBe("fr");
@@ -438,6 +438,22 @@ describe("RFC 9555 mapping", () => {
     expect(edited).not.toContain("https://a.example\r\n");
     expect(edited).toContain("FBURL:https://a.example/fb");
     expect(edited).not.toContain("CALADRURI");
+  });
+
+  it("escapes commas in URI values and inlines a data: LOGO or KEY as ENCODING=b, the forms vobject keeps whole", () => {
+    const text = serializeVCard({
+      uid: "1",
+      links: { l0: { uri: "https://x.test/a,b" } },
+      media: { m0: { kind: "logo", uri: "data:image/png;base64,iVBORw0KGgo=" } },
+      cryptoKeys: { k0: { uri: "data:application/pgp-keys;base64,aGVsbG8=" } },
+    });
+    expect(text).toContain("URL;PROP-ID=l0:https://x.test/a\\,b");
+    expect(text).toContain("LOGO;PROP-ID=m0;ENCODING=b;MEDIATYPE=image/png:iVBORw0KGgo=");
+    expect(text).toContain("KEY;PROP-ID=k0;ENCODING=b;MEDIATYPE=application/pgp-keys:aGVsbG8=");
+    const [back] = parseVCards(text);
+    expect(back!.links?.l0?.uri).toBe("https://x.test/a,b");
+    expect(back!.media?.m0).toEqual({ kind: "logo", uri: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" });
+    expect(back!.cryptoKeys?.k0).toEqual({ uri: "data:application/pgp-keys;base64,aGVsbG8=", mediaType: "application/pgp-keys" });
   });
 
   it("accepts the webmail's date strings and keeps a stored photo out of the preserved lines", () => {
