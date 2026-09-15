@@ -312,6 +312,69 @@ describe("Calendar/get + set", () => {
   });
 });
 
+describe("default calendar", () => {
+  const EVENT = { title: "x", start: "2025-01-01T10:00:00", duration: "PT1H", timeZone: "Europe/Paris" };
+
+  it("is the `calendar` collection whatever order the server lists them in", async () => {
+    dav.addCalendar("work", "Work");
+    dav.addCalendar("calendar", "Personnel");
+    const r = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(r.list.map((c) => [c.name, c.isDefault])).toEqual([
+      ["Work", false],
+      ["Personnel", true],
+    ]);
+  });
+
+  it("falls back to the first href in sorted order, never a VTODO-only collection", async () => {
+    dav.addCalendar("zeta", "Zeta");
+    dav.addCalendar("alpha", "Alpha");
+    dav.addCalendar("aaa-tasks", "Tasks", [], ["VTODO"]);
+    const r = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(r.list.find((c) => c.isDefault)?.name).toBe("Alpha");
+  });
+
+  it("follows onSuccessSetIsDefault across requests and is where events without calendarIds land", async () => {
+    const personal = dav.addCalendar("calendar", "Personnel");
+    const work = dav.addCalendar("work", "Work");
+    const r = await calendarSet({ accountId: "7", onSuccessSetIsDefault: calendarId(work) }, ctx);
+    expect(r.updated).toEqual({ [calendarId(work)]: { isDefault: true }, [calendarId(personal)]: { isDefault: false } });
+
+    const list = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(list.list.find((c) => c.isDefault)?.name).toBe("Work");
+
+    const e = await calendarEventSet({ accountId: "7", create: { e: EVENT } }, ctx);
+    expect(e.notCreated).toBeNull();
+    expect(dav.cals.get(work)!.resources.size).toBe(1);
+    expect(dav.cals.get(personal)!.resources.size).toBe(0);
+  });
+
+  it("resolves a creation reference and flags the new calendar in `created`", async () => {
+    const personal = dav.addCalendar("calendar", "Personnel");
+    const r = await calendarSet({ accountId: "7", create: { n: { name: "Family" } }, onSuccessSetIsDefault: "#n" }, ctx);
+    expect(r.created?.["n"]?.isDefault).toBe(true);
+    expect(r.updated).toEqual({ [calendarId(personal)]: { isDefault: false } });
+    const list = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(list.list.find((c) => c.isDefault)?.name).toBe("Family");
+  });
+
+  it("ignores an unknown id, skips the change when a write failed, drops back once the chosen calendar is gone", async () => {
+    dav.addCalendar("calendar", "Personnel");
+    const work = dav.addCalendar("work", "Work");
+
+    const unknown = await calendarSet({ accountId: "7", onSuccessSetIsDefault: calendarId(`${HOME}nope/`) }, ctx);
+    expect(unknown.updated).toBeNull();
+
+    const failed = await calendarSet({ accountId: "7", create: { x: { name: " " } }, onSuccessSetIsDefault: calendarId(work) }, ctx);
+    expect(failed.notCreated?.["x"]).toBeDefined();
+    expect(failed.updated).toBeNull();
+    expect((await calendarGet({ accountId: "7", ids: null }, ctx)).list.find((c) => c.isDefault)?.name).toBe("Personnel");
+
+    await calendarSet({ accountId: "7", onSuccessSetIsDefault: calendarId(work) }, ctx);
+    await calendarSet({ accountId: "7", destroy: [calendarId(work)] }, ctx);
+    expect((await calendarGet({ accountId: "7", ids: null }, ctx)).list.map((c) => [c.name, c.isDefault])).toEqual([["Personnel", true]]);
+  });
+});
+
 describe("CalendarEvent/get + query", () => {
   it("returns parsed events with ids, calendarIds and UTC bounds", async () => {
     const href = dav.addCalendar("work", "Work", [["m.ics", MEETING]]);

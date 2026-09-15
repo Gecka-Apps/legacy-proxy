@@ -116,7 +116,8 @@ interface SetResponse<Created> {
   oldState: string;
   newState: string;
   created: Record<string, Created> | null;
-  updated: Record<string, null> | null;
+  /** Server-set properties that changed as a side effect, or null when none. */
+  updated: Record<string, Record<string, unknown> | null> | null;
   destroyed: string[] | null;
   notCreated: Record<string, SetError> | null;
   notUpdated: Record<string, SetError> | null;
@@ -187,10 +188,19 @@ function eventCalendars(cals: CalendarInfo[]): CalendarInfo[] {
   return cals.filter((c) => c.components.length === 0 || c.components.includes("VEVENT"));
 }
 
-function defaultCalendarHref(ctx: CalendarCtx, cals: CalendarInfo[]): string | null {
+/**
+ * The calendar flagged isDefault and used when an event is created without a
+ * calendarIds. The account's stored choice wins as long as that calendar still
+ * exists; otherwise the `calendar` collection (the one a fresh account gets),
+ * otherwise the first by href. The server lists collections in directory
+ * order, so nothing here relies on the order of the PROPFIND response.
+ */
+function defaultCalendar(ctx: CalendarCtx, cals: CalendarInfo[]): CalendarInfo | undefined {
+  if (cals.length === 0) return undefined;
   const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_CALENDAR);
-  if (pref && cals.some((c) => calendarId(c.href) === pref)) return decodeId(pref);
-  return cals[0]?.href ?? null;
+  const chosen = pref ? cals.find((c) => calendarId(c.href) === pref) : undefined;
+  if (chosen) return chosen;
+  return cals.find((c) => leaf(c.href) === DEFAULT_CALENDAR_SLUG) ?? [...cals].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 export async function calendarGet(
@@ -200,8 +210,8 @@ export async function calendarGet(
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const client = makeClient(ctx);
   const cals = eventCalendars(await client.listCalendars());
-  const def = defaultCalendarHref(ctx, cals);
-  const all = cals.map((c) => projectCalendar(ctx, c, c.href === def));
+  const def = defaultCalendar(ctx, cals);
+  const all = cals.map((c) => projectCalendar(ctx, c, c === def));
   const list = (args.ids ? all.filter((c) => args.ids!.includes(c.id as string)) : all).map((c) => project(c, args.properties));
   const notFound = args.ids ? args.ids.filter((id) => !all.some((c) => c.id === id)) : [];
   return { accountId: args.accountId, state: combinedState(cals), list, notFound };
@@ -212,7 +222,7 @@ const CALENDAR_PREF_PROPS = new Set(["sortOrder", "isSubscribed", "isVisible", "
 const CALENDAR_IGNORED = new Set(["isDefault", "shareWith", "myRights", "id"]);
 
 export async function calendarSet(
-  args: SetArgs & { onDestroyRemoveEvents?: boolean },
+  args: SetArgs & { onDestroyRemoveEvents?: boolean; onSuccessSetIsDefault?: string | null },
   ctx: CalendarCtx,
 ): Promise<SetResponse<JsonObject>> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
@@ -221,6 +231,7 @@ export async function calendarSet(
   const oldState = combinedState(cals);
   if (args.ifInState != null && args.ifInState !== oldState) throw new JmapError("stateMismatch");
   const out = emptySet<JsonObject>(args.accountId, oldState);
+  const previousDefault = defaultCalendar(ctx, eventCalendars(cals));
 
   for (const [tempId, raw] of Object.entries(args.create ?? {})) {
     try {
@@ -245,10 +256,10 @@ export async function calendarSet(
       const id = calendarId(href);
       savePrefs(ctx, id, raw);
       const info: CalendarInfo = { href, displayName: name, description: null, color: null, components: ["VEVENT"], ctag: null };
-      const projected = projectCalendar(ctx, info, cals.length === 0);
+      cals = [...cals, info];
+      const projected = projectCalendar(ctx, info, defaultCalendar(ctx, eventCalendars(cals)) === info);
       const { name: _n, ...serverSet } = projected;
       (out.created ??= {})[tempId] = serverSet;
-      cals = [...cals, info];
     } catch (e) {
       log.warn({ err: (e as Error).message, tempId }, "Calendar/set create failed");
       (out.notCreated ??= {})[tempId] = errorFor(e, "invalidProperties");
@@ -321,6 +332,32 @@ export async function calendarSet(
     cals = await client.listCalendars();
     out.newState = combinedState(cals);
     ctx.store.bumpState(ctx.account.id, "calendar");
+  }
+
+  // draft-ietf-jmap-calendars §4.3: applied only when every create, update
+  // and destroy went through; an id that matches nothing is ignored, not an
+  // error. A `#tempId` names a calendar created above. The calendars whose
+  // isDefault flips are reported back with the server-set value.
+  if (args.onSuccessSetIsDefault != null && !out.notCreated && !out.notUpdated && !out.notDestroyed) {
+    let wanted = args.onSuccessSetIsDefault;
+    let createdAs: string | null = null;
+    if (wanted.startsWith("#")) {
+      createdAs = wanted.slice(1);
+      wanted = (out.created?.[createdAs]?.id as string | undefined) ?? "";
+    }
+    const target = eventCalendars(cals).find((c) => calendarId(c.href) === wanted);
+    if (target) {
+      ctx.store.setPref(ctx.account.id, PREF_DEFAULT_CALENDAR, wanted);
+      const created = createdAs ? out.created?.[createdAs] : undefined;
+      if (created) {
+        created.isDefault = true;
+      } else if (previousDefault?.href !== target.href) {
+        (out.updated ??= {})[wanted] = { isDefault: true };
+      }
+      if (previousDefault && previousDefault.href !== target.href && cals.some((c) => c.href === previousDefault.href)) {
+        (out.updated ??= {})[calendarId(previousDefault.href)] = { isDefault: false };
+      }
+    }
   }
   return out;
 }
@@ -605,12 +642,13 @@ function stripAtType(o: unknown): void {
   for (const v of Object.values(r)) stripAtType(v);
 }
 
-function resolveCalendar(cals: CalendarInfo[], calendarIds: unknown): { cal: CalendarInfo } | { error: SetError } {
-  if (cals.length === 0) return { error: setError("invalidProperties", "no calendar exists on the CalDAV server", ["calendarIds"]) };
-  if (calendarIds == null) return { cal: cals[0]! };
+/** Pick the (single) calendar an event should live in, `fallback` when the client names none. */
+function resolveCalendar(cals: CalendarInfo[], fallback: CalendarInfo | undefined, calendarIds: unknown): { cal: CalendarInfo } | { error: SetError } {
+  if (cals.length === 0 || !fallback) return { error: setError("invalidProperties", "no calendar exists on the CalDAV server", ["calendarIds"]) };
+  if (calendarIds == null) return { cal: fallback };
   if (typeof calendarIds !== "object") return { error: setError("invalidProperties", "calendarIds must be an object", ["calendarIds"]) };
   const ids = Object.entries(calendarIds as Record<string, unknown>).filter(([, on]) => on === true).map(([id]) => id);
-  if (ids.length === 0) return { cal: cals[0]! };
+  if (ids.length === 0) return { cal: fallback };
   if (ids.length > 1) return { error: setError("invalidProperties", "a CalDAV event can only live in one calendar", ["calendarIds"]) };
   const cal = cals.find((c) => calendarId(c.href) === ids[0]);
   if (!cal) return { error: setError("invalidProperties", "unknown calendarId", ["calendarIds"]) };
@@ -666,7 +704,7 @@ export async function calendarEventSet(
       const input = structuredClone(raw) as Record<string, unknown>;
       stripAtType(input);
       if (cals.length === 0 && !hasExplicitCalendar(input["calendarIds"])) cals = [await ensureDefaultCalendar(client)];
-      const picked = resolveCalendar(cals, input["calendarIds"]);
+      const picked = resolveCalendar(cals, defaultCalendar(ctx, cals), input["calendarIds"]);
       if ("error" in picked) {
         (out.notCreated ??= {})[tempId] = picked.error;
         continue;
