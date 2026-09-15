@@ -368,8 +368,8 @@ describe("ContactCard/set", () => {
     expect(put?.body).toContain("UID:urn:uuid:new-1");
     expect(put?.body).toContain("FN:Bob Builder");
     expect(put?.body).toContain("N:Builder;Bob;;;");
-    expect(put?.body).toContain("EMAIL;TYPE=work:bob@example.test");
-    expect(put?.body).toContain("TEL;TYPE=cell:+1 555 0100");
+    expect(put?.body).toContain("EMAIL;PROP-ID=e1;TYPE=work:bob@example.test");
+    expect(put?.body).toContain("TEL;PROP-ID=p1;TYPE=cell:+1 555 0100");
 
     // The id round-trips through ContactCard/get (what webmail does next).
     const got = await contactCardGet({ accountId: "7", ids: [created!.id] }, ctx);
@@ -444,10 +444,10 @@ describe("ContactCard/set", () => {
     const put = dav.calls.find((c) => c.method === "PUT")!;
     expect(put.headers["if-match"]).toBe('"e1"');
     expect(put.body).toContain("FN:Alice Changed");
-    expect(put.body).toContain("EMAIL;TYPE=work:alice+new@example.test");
-    expect(put.body).toContain("NOTE:line one\\nline two");
-    // Properties we don't model survive the round trip.
-    expect(put.body).toContain("PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRg==");
+    expect(put.body).toContain("EMAIL;PROP-ID=e1;TYPE=work:alice+new@example.test");
+    expect(put.body).toContain("NOTE;PROP-ID=n1:line one\\nline two");
+    // The photo is re-emitted in vCard 4.0 form; properties we don't model survive verbatim.
+    expect(put.body).toContain("PHOTO;PROP-ID=photo1:data:image/jpeg;base64,/9j/4AAQSkZJRg==");
     expect(put.body).toContain("X-CUSTOM-THING:keep me");
     expect(put.body).toContain("UID:alice-uid");
     expect(put.body.match(/^FN:/gm)).toHaveLength(1);
