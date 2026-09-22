@@ -357,6 +357,8 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `DEFAULT_PROVIDER`         | `generic`                          | provider key when `/api/login` omits one             |
 | `PROVIDERS_FILE`           | `/etc/legacy-proxy/providers.json` | provider catalogue                                   |
 | `LOG_LEVEL`                | `info`                             | pino level                                           |
+| `TRUSTED_PROXIES`          | unset                              | reverse proxies whose forwarding header may be read  |
+| `CLIENT_IP_HEADER`         | `x-forwarded-for`                  | header the client address is read from                |
 | `MAX_CONCURRENT_REQUESTS`  | `10`                               | advertised on `coreCapabilityProps`                  |
 | `MAX_OBJECTS_IN_GET`       | `500`                              | advertised on `coreCapabilityProps`                  |
 | `MAX_OBJECTS_IN_SET`       | `500`                              | advertised on `coreCapabilityProps`                  |
@@ -364,6 +366,16 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `MAX_SIZE_REQUEST`         | `10_000_000` (10 MB)               | JMAP POST body limit, advertised in caps             |
 | `MAX_CALLS_IN_REQUEST`     | `64`                               | per-envelope method-call cap                         |
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
+
+Behind a reverse proxy the connection peer is the proxy itself, so request logs
+and anything keyed on the client address collapse onto a single address. Naming
+the proxy in `TRUSTED_PROXIES` has the address read from a forwarding header
+instead. The list takes addresses, CIDR blocks and the `loopback`, `linklocal`
+and `uniquelocal` keywords, comma separated; an empty list reads no header at
+all, a header on its own being a claim the caller makes about itself.
+`CLIENT_IP_HEADER` names that header, holding either a single address
+(`X-Real-IP`) or a chain (`X-Forwarded-For`) walked from the right past the
+trusted proxies.
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
