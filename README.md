@@ -41,7 +41,7 @@ What that means concretely:
   `/api/login` endpoint or plain HTTP Basic, which is enough to run the
   upstream JMAP compliance suite straight against it.
 
-It is built primarily for [Bulwark Mail](https://bulwarkmail.com)'s webmail,
+It is built primarily for [Bulwark Mail](https://bulwarkmail.org)'s webmail,
 but the proxy is independent of any one client: anything that speaks
 RFC 8621 should work, and the test suite exercises it with the official
 `jmapio/jmap-test-suite`.
