@@ -36,11 +36,19 @@ function open() {
   return store;
 }
 
-it("folds a label name into a keyword, keeping its nesting", () => {
-  expect(labelKeyword("Fornitori/Società Agricola")).toBe("$label:fornitori/societa-agricola");
-  expect(labelKeyword("Da leggere")).toBe("$label:da-leggere");
-  // A name with nothing an IMAP flag can hold cannot be carried as a tag.
-  expect(labelKeyword("★")).toBeNull();
+it("turns a label name into a keyword, keeping its nesting", () => {
+  expect(labelKeyword("Fornitori/Società Agricola")).toBe("$label:fornitori/societ=c3=a0_agricola");
+  expect(labelKeyword("Da leggere")).toBe("$label:da_leggere");
+  // A name with nothing an IMAP flag can hold still gets a tag.
+  expect(labelKeyword("★")).toBe("$label:=e2=98=85");
+  expect(labelKeyword("Проекты")).toMatch(/^\$label:[=0-9a-f]+$/);
+});
+
+it("never gives two labels the same keyword", () => {
+  const names = ["Проекты 2024", "Счета 2024", "Q1 2026", "Q1-2026", "Q1_2026", "Café", "Cafe", "a=b", "a=3db", "x/y", "x / y"];
+  const keywords = names.map(labelKeyword);
+  expect(new Set(keywords).size).toBe(names.length);
+  for (const k of keywords) expect(k).toMatch(/^\$label:[!-~]+$/);
 });
 
 it("puts user labels on the message as tags, and leaves system labels to mailboxes", async () => {
@@ -64,7 +72,7 @@ it("puts user labels on the message as tags, and leaves system labels to mailbox
     ids: ["m_a"],
     properties: ["keywords", "mailboxIds"],
   })) as { list: { keywords: Record<string, true>; mailboxIds: Record<string, true> }[] };
-  expect(result.list[0]!.keywords).toEqual({ "$label:fornitori/societa-agricola": true });
+  expect(result.list[0]!.keywords).toEqual({ "$label:fornitori/societ=c3=a0_agricola": true });
   // The label is still a mailbox too: that is what a folder view reads.
   expect(result.list[0]!.mailboxIds).toEqual({ all: true, l_INBOX: true, l_Label_1: true });
 });
@@ -72,12 +80,12 @@ it("puts user labels on the message as tags, and leaves system labels to mailbox
 const message = { id: "a", threadId: "t", internalDate: "1000", labelIds: ["INBOX", "Label_1"] };
 
 it("adds and removes the Gmail label a tag names", () => {
-  expect(emailPatch(message, { "keywords/$label:da-leggere": true }, labels)).toEqual({
+  expect(emailPatch(message, { "keywords/$label:da_leggere": true }, labels)).toEqual({
     addLabelIds: ["Label_2"],
     removeLabelIds: [],
   });
   // A "/" inside a patch token is escaped as ~1, so a nested tag reads as one path segment.
-  expect(emailPatch(message, { "keywords/$label:fornitori~1societa-agricola": null }, labels)).toEqual({
+  expect(emailPatch(message, { "keywords/$label:fornitori~1societ=c3=a0_agricola": null }, labels)).toEqual({
     addLabelIds: [],
     removeLabelIds: ["Label_1"],
   });
@@ -99,14 +107,14 @@ it("strips labels only when the keywords it is given mention tags at all", () =>
   });
   // Naming one tag means the set is the truth: the others go. Leaving $seen
   // out of a wholesale set means unread, which is UNREAD to Gmail.
-  expect(emailPatch(message, { keywords: { "$label:da-leggere": true } }, labels)).toEqual({
+  expect(emailPatch(message, { keywords: { "$label:da_leggere": true } }, labels)).toEqual({
     addLabelIds: ["Label_2", "UNREAD"],
     removeLabelIds: ["Label_1"],
   });
 });
 
 it("searches a tag as the label it is", () => {
-  expect(gmailFilter({ hasKeyword: "$label:da-leggere" }, labels)).toBe('label:"Da leggere"');
+  expect(gmailFilter({ hasKeyword: "$label:da_leggere" }, labels)).toBe('label:"Da leggere"');
   expect(gmailFilter({ hasKeyword: "$label:gone" }, labels)).toBe("in:anywhere -in:anywhere");
 });
 
@@ -133,7 +141,7 @@ it("enumerates the account's keywords from the labels rather than the mailbox", 
   };
   expect(result.totalEmails).toBe(100);
   expect(result.list).toContainEqual({
-    id: "$label:fornitori/societa-agricola",
+    id: "$label:fornitori/societ=c3=a0_agricola",
     name: "Fornitori/Società Agricola",
     color: "#42d692",
     total: 12,
@@ -164,9 +172,9 @@ it("counts a tag from its label's counters, and an unknown tag without asking Gm
   const count = async (filter: unknown) =>
     ((await query({ accountId: mail.accountId, filter, limit: 1, calculateTotal: true })) as { total: number }).total;
 
-  expect(await count({ hasKeyword: "$label:da-leggere" })).toBe(7);
+  expect(await count({ hasKeyword: "$label:da_leggere" })).toBe(7);
   expect(
-    await count({ operator: "AND", conditions: [{ hasKeyword: "$label:da-leggere" }, { notKeyword: "$seen" }] }),
+    await count({ operator: "AND", conditions: [{ hasKeyword: "$label:da_leggere" }, { notKeyword: "$seen" }] }),
   ).toBe(3);
   // Exact counters and a listing by label id: never a search.
   expect(calls.some((c) => c.endsWith("?q"))).toBe(false);

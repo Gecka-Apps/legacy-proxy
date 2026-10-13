@@ -37,23 +37,25 @@ export const LABEL_KEYWORD = "$label:";
  *
  * The id is the label's own name, so nesting survives - Gmail writes it with
  * "/" and so do those clients. Case is dropped because keywords are
- * case-insensitive; accents are folded and anything an IMAP flag cannot hold
- * is removed, which is why this can return null for a name made entirely of
- * such characters.
+ * case-insensitive, and so are Gmail label names. A space becomes "_" and every
+ * other character an IMAP flag cannot hold, "_" and "=" included, is written as
+ * "=" plus the hex of its UTF-8 bytes. Nothing is dropped or folded, so two
+ * labels never share a keyword: "Q1 2026" and "Q1-2026", or "Cafe" and "Café",
+ * stay apart, and a name in Cyrillic or CJK still gets one.
  */
 export function labelKeyword(name: string): string | null {
   const id = name
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .split("/")
     .map((level) =>
-      level
-        .trim()
-        .replace(/\s+/g, "-")
-        .replace(/[^a-z0-9._-]/g, ""),
+      Array.from(level, (ch) =>
+        /[a-z0-9.-]/.test(ch)
+          ? ch
+          : ch === " "
+            ? "_"
+            : Array.from(Buffer.from(ch, "utf8"), (b) => "=" + b.toString(16).padStart(2, "0")).join(""),
+      ).join(""),
     )
-    .filter(Boolean)
     .join("/");
   return id ? LABEL_KEYWORD + id : null;
 }
