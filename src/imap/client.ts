@@ -23,12 +23,23 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
     port: provider.imap.port,
     secure: provider.imap.secure ?? true,
     auth,
-    logger: false,
+    logger: imapflowLogger,
   });
   await client.connect();
   log.debug({ host: provider.imap.host, mech: creds.mech }, "imap connected");
   return client;
 }
+
+// imapflow reports a failed MOVE or COPY only by returning false and logging
+// the error. Keep its warnings so the server's NO text reaches our log; the
+// rest of its logging stays off, as before.
+const imapflowLogger = {
+  debug: () => {},
+  info: () => {},
+  error: () => {},
+  warn: (obj: { msg?: string; err?: unknown; cid?: string }) =>
+    log.warn({ cid: obj?.cid, ...(obj?.err ? imapErrorDetails(obj.err) : {}) }, obj?.msg ?? "imap command failed"),
+};
 
 export async function withMailbox<T>(
   client: ImapFlow,
