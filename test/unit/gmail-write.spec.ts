@@ -103,14 +103,55 @@ it("archives while retaining user labels, and supports trash/restore", () => {
     addLabelIds: [],
     removeLabelIds: ["INBOX"],
   });
+  // Gmail keeps a message's labels while it sits in Trash or Spam.
   expect(emailPatch(message, { mailboxIds: { l_TRASH: true }, "keywords/$seen": true }, labels)).toEqual({
     addLabelIds: ["TRASH"],
-    removeLabelIds: ["INBOX", "Label_1", "UNREAD"],
+    removeLabelIds: ["INBOX", "UNREAD"],
   });
-  expect(emailPatch({ ...message, labelIds: ["TRASH"] }, { mailboxIds: { l_INBOX: true } }, labels)).toEqual({
+  expect(emailPatch(message, { mailboxIds: { l_SPAM: true } }, labels)).toEqual({
+    addLabelIds: ["SPAM"],
+    removeLabelIds: ["INBOX"],
+  });
+  // So restoring it brings them back.
+  expect(
+    emailPatch({ ...message, labelIds: ["TRASH", "Label_1"] }, { mailboxIds: { l_INBOX: true } }, labels),
+  ).toEqual({
     addLabelIds: ["INBOX"],
     removeLabelIds: ["TRASH"],
   });
+  // An ordinary move still leaves the folder it came from.
+  expect(emailPatch(message, { mailboxIds: { l_INBOX: true } }, labels)).toEqual({
+    addLabelIds: [],
+    removeLabelIds: ["Label_1"],
+  });
+});
+it("marks spam and not spam the way Bulwark asks for it", () => {
+  expect(
+    emailPatch(message, { mailboxIds: { l_SPAM: true }, "keywords/$junk": true, "keywords/$notjunk": null }, labels),
+  ).toEqual({ addLabelIds: ["SPAM"], removeLabelIds: ["INBOX"] });
+  expect(
+    emailPatch(
+      { ...message, labelIds: ["SPAM", "Label_1"] },
+      { mailboxIds: { l_INBOX: true }, "keywords/$junk": null, "keywords/$notjunk": true },
+      labels,
+    ),
+  ).toEqual({ addLabelIds: ["INBOX"], removeLabelIds: ["SPAM"] });
+  // The keyword alone moves it too, and dropping $notjunk is no verdict.
+  expect(emailPatch(message, { "keywords/$junk": true }, labels)).toEqual({
+    addLabelIds: ["SPAM"],
+    removeLabelIds: [],
+  });
+  expect(emailPatch(message, { "keywords/$notjunk": null }, labels)).toEqual({
+    addLabelIds: [],
+    removeLabelIds: [],
+  });
+});
+it("accepts keywords Gmail has no place for without failing the update", () => {
+  for (const k of ["$answered", "$forwarded", "$phishing", "$mdnsent"])
+    expect(emailPatch(message, { ["keywords/" + k]: true, "keywords/$seen": true }, labels)).toEqual({
+      addLabelIds: [],
+      removeLabelIds: ["UNREAD"],
+    });
 });
 it.each([
   { subject: "changed" },

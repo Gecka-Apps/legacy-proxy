@@ -620,7 +620,8 @@ snapshot across pages, so concurrent mailbox changes can still affect pagination
 Email IDs are stable across labels. The synthetic `All mail` mailbox includes
 **spam and trash**, matching the account-wide profile counts. Label names are
 flat. Gmail's unread, starred, important and Chat labels are not listed as mailboxes
-(the `$seen`, `$flagged` and `$important` keywords carry them); system labels get
+(the `$seen`, `$flagged` and `$important` keywords carry them; `$junk` and
+`$notjunk` move mail into and out of Spam); system labels get
 readable names, and labels hidden in Gmail's label list are unsubscribed. Only
 `receivedAt` sorting is accepted, using Gmail's native list order (or its reverse);
 strict timestamp ordering is not guaranteed by the list API. Supported search

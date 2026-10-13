@@ -10,6 +10,8 @@ const KEYWORDS: Record<string, { label: string; inverse?: boolean }> = {
   $flagged: { label: "STARRED" },
   $important: { label: "IMPORTANT" },
 };
+/** Keywords Gmail has no place for. Setting one is accepted and changes nothing, so a reply or a read receipt doesn't fail the whole update. */
+const IGNORED_KEYWORDS = new Set(["$answered", "$forwarded", "$phishing", "$mdnsent"]);
 export const writableLabel = (label: GmailLabel): boolean =>
   label.type === "user" || ["INBOX", "SPAM", "TRASH"].includes(label.id);
 function object(value: unknown): Record<string, unknown> {
@@ -60,6 +62,11 @@ export function emailPatch(
       if (!value) return;
       invalid("Unknown label keyword");
     }
+    // Spam is the SPAM label. Only a request that says junk or not junk moves
+    // the message; dropping $notjunk alone is not a verdict.
+    if (key === "$junk") return set("SPAM", value);
+    if (key === "$notjunk") return value ? set("SPAM", false) : undefined;
+    if (value && IGNORED_KEYWORDS.has(key)) return;
     if (key === "$draft" && current.has("DRAFT") === value) return;
     if (!value && key !== "$draft") return; // Removing an absent custom keyword is a no-op.
     invalid("Unsupported keyword change");
@@ -73,10 +80,14 @@ export function emailPatch(
         if (v !== true) invalid("Mailbox membership must be true");
         mailbox(id, true);
       }
-      // Gmail All mail is the archive destination. Preserve user labels when archiving.
+      // Gmail All mail is the archive destination. Preserve user labels when
+      // archiving, and, as Gmail does, while mail sits in Trash or Spam, so
+      // restoring it brings its labels back.
       const archive = Object.keys(ids).length === 1 && ids[ALL_MAIL] === true;
+      const binned = ["TRASH", "SPAM"].some((id) => "l_" + id in ids || current.has(id));
+      const keepUserLabels = archive || binned;
       for (const l of labels)
-        if (writableLabel(l) && !("l_" + l.id in ids) && (!archive || l.type !== "user")) set(l.id, false);
+        if (writableLabel(l) && !("l_" + l.id in ids) && (!keepUserLabels || l.type !== "user")) set(l.id, false);
     } else if (key === "keywords") {
       if (Object.keys(p).some((k) => k.startsWith("keywords/"))) invalid("Overlapping keyword patch paths");
       const keywords = object(value);
