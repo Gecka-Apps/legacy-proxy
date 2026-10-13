@@ -50,6 +50,11 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       !uris.length ||
       !uris.every((u) => {
         if (typeof u !== "string") return false;
+        // `*` stands for a path segment only: never in the scheme, host, port or query.
+        const path = u.indexOf("/", u.indexOf("://") + 3);
+        const query = u.search(/[?#]/);
+        if (u.includes("*") && (path < 0 || u.indexOf("*") < path || (query >= 0 && u.lastIndexOf("*") > query)))
+          return false;
         try {
           const url = new URL(u.replaceAll("*", "x"));
           return (
@@ -69,11 +74,21 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
   });
 }
 
-/** Exact match, where `*` in the registered URI stands for one path segment (a locale, say). */
+/**
+ * Exact match, where `*` in the registered URI stands for one path segment (a locale, say).
+ * The URI must already be in the form a browser sends: a backslash, a dot segment or an
+ * encoded dot would be rewritten on the way, and the code would land somewhere else.
+ */
 export function redirectAllowed(client: OAuthClient, uri: string): boolean {
+  try {
+    if (new URL(uri).href !== uri) return false;
+  } catch {
+    return false;
+  }
+  const segment = String.raw`(?!\.{1,2}(?:[/?#]|$))[^/?#\\%]+`;
   return client.redirectUris.some((pattern) =>
     new RegExp(
-      "^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^/?#]+") + "$",
+      "^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(segment) + "$",
     ).test(uri),
   );
 }

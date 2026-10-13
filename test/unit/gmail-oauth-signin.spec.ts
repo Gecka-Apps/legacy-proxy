@@ -123,6 +123,13 @@ describe("OAuth client registration", () => {
     expect(redirectAllowed(client!, "https://mail.example.com/a/b/auth/callback")).toBe(false);
     expect(redirectAllowed(client!, "https://mail.example.com.evil.test/it/auth/callback")).toBe(false);
     expect(redirectAllowed(client!, "https://mail.example.com/it/auth/callback?x=1")).toBe(false);
+    // Each of these is rewritten by the browser into a different place than it seems to name.
+    for (const segment of ["evil.com\\.x", "..", ".", "%2e%2e", ".%2e", "a%2fb"])
+      expect(redirectAllowed(client!, `https://mail.example.com/${segment}/auth/callback`), segment).toBe(false);
+    expect(redirectAllowed(client!, "https://mail.example.com/../auth/callback")).toBe(false);
+    // A wildcard in the host would let any host in.
+    for (const uri of ["https://*.example.com/cb", "https://*/cb", "https://mail.example.com:*/cb", "https://mail.example.com/cb?x=*"])
+      expect(() => parseOAuthClients(JSON.stringify([{ id: "x", redirectUris: [uri] }])), uri).toThrow();
     expect(parseOAuthClients(undefined)).toEqual([]);
     expect(() => parseOAuthClients('[{"id":"x","redirectUris":["http://mail.example.com/cb"]}]')).toThrow();
     expect(() => parseOAuthClients('[{"id":"x","redirectUris":[]}]')).toThrow();
