@@ -207,6 +207,27 @@ it("pushes the delivered message, not just the fact of a delivery", async () => 
   ).toBe(false);
 });
 
+it("still pushes an arrival that a client request synced first", async () => {
+  const { mail, call, deliver, push, store } = await setup();
+  await subscribeWithEmailPush(call, mail.accountId, { properties: ["id"] });
+
+  deliver("m1");
+  // An open tab asks for something once its profile cache has run out, and
+  // that request moves the cursor before the coalesced push sync runs.
+  store.invalidate(email);
+  await mail.state();
+  await push.sync(email);
+
+  const pushed = posts.filter((p) => p.kind === "EmailPush");
+  expect(pushed).toHaveLength(1);
+  expect(pushed[0]!.body.emails).toEqual([{ id: "m_m1" }]);
+
+  // And once told, a quiet sync tells nobody again.
+  posts.length = 0;
+  await push.sync(email);
+  expect(posts).toHaveLength(0);
+});
+
 it("stays quiet when the delivery is not one the subscriber asked for", async () => {
   const { mail, call, deliver, push } = await setup();
   await subscribeWithEmailPush(call, mail.accountId, {

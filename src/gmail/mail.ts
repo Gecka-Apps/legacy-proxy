@@ -109,8 +109,15 @@ export class GmailMail {
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
-  /** Messages Gmail delivered during the last incremental sync, for push fan-out. */
+  /** Messages Gmail delivered during the last push sync, for push fan-out. */
   private lastDelivered: string[] = [];
+  /**
+   * Deliveries and the state no push has told subscribers about yet. Any
+   * request can run the sync that moves the cursor, so a push compares with
+   * what it last published rather than with what it saw before its own run.
+   */
+  private undelivered: string[] = [];
+  private publishedState?: string;
   readonly subscriptions: GmailSubscriptions;
   constructor(
     private email: string,
@@ -173,22 +180,17 @@ export class GmailMail {
   }
   /** Push/recovery entry point: refresh the profile and run the incremental engine. */
   async pushSync(): Promise<{ changed: boolean; delivered: number }> {
-    const before =
-      this.store.revision(this.email) +
-      ":" +
-      (this.store.cursor(this.email) ?? "");
-    this.lastDelivered = [];
     const fresh = await this.api.get<GmailProfile>("profile", 1);
     this.store.cache(this.email, "profile", fresh, 30_000);
     await this.profile();
-    return {
-      changed:
-        before !==
-        this.store.revision(this.email) +
-          ":" +
-          (this.store.cursor(this.email) ?? ""),
-      delivered: this.lastDelivered.length,
-    };
+    const state =
+      this.store.revision(this.email) +
+      ":" +
+      (this.store.cursor(this.email) ?? "");
+    const changed = state !== this.publishedState;
+    this.publishedState = state;
+    this.lastDelivered = this.undelivered.splice(0);
+    return { changed, delivered: this.lastDelivered.length };
   }
   /**
    * The messages this account has just received, as a push subscriber asked
@@ -307,7 +309,11 @@ export class GmailMail {
     this.syncFlight = (async () => {
       try {
         const history = await readHistory(this.api, cursor);
-        this.lastDelivered = await this.deliveries(history.records);
+        const delivered = await this.deliveries(history.records);
+        // Capped: without push nothing ever drains it.
+        this.undelivered = [
+          ...new Set([...this.undelivered, ...delivered]),
+        ].slice(-MAX_BATCH);
         if (this.store.revision(this.email) === revision) {
           const changed = affected(history.records);
           this.store.checkpoint(
