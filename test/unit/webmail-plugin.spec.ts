@@ -77,7 +77,7 @@ describe("planning tag definitions", () => {
   it("defines each label under the id the bridge writes on messages", () => {
     const plan = planTags([label("Clienti/Acmè SpA", "#b6cff5")], [], {});
     expect(plan).toEqual([
-      { id: "clienti/acme-spa", label: "Acmè SpA", color: "blue-light", visibility: "hide" },
+      { id: "clienti/acm=c3=a8_spa", label: "Acmè SpA", color: "blue-light", visibility: "hide" },
     ]);
   });
 
