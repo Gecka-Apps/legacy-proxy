@@ -7,7 +7,7 @@ import { GmailStore } from "../../src/gmail/store.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
-  for (const f of cleanup.splice(0)) f();
+  for (const f of cleanup.splice(0).reverse()) f();
   vi.useRealTimers();
 });
 function open(limit: number, key = crypto.randomBytes(32), dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-cache-"))) {
