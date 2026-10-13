@@ -1391,10 +1391,35 @@ export async function applyEmailUpdate(
     if (destMbox) {
       const moved = await ctx.client.messageMove(`${parts.uid}`, destMbox.name, { uid: true });
       if (!moved) {
-        throw new JmapError("serverFail", `MOVE to "${destMbox.name}" failed`);
+        if (ctx.account.kind !== "gmail") {
+          throw new JmapError("serverFail", `MOVE to "${destMbox.name}" failed`);
+        }
+        await refileByAppend(ctx.client, parts.uid, destMbox.name);
       }
     }
   });
+}
+
+// Gmail can refuse UID MOVE out of [Gmail]/Drafts once the draft has gone out
+// through its own SMTP server, which left sent mail stuck in Drafts. Append a
+// copy to the destination and expunge the source instead. Gmail folders are
+// labels, so if the append lands on the same message (Gmail dedupes by
+// Message-ID) the expunge only takes the Drafts label off it. Must run with
+// the source mailbox selected.
+export async function refileByAppend(client: ImapFlow, uid: number, destName: string): Promise<void> {
+  const msg = await client.fetchOne(
+    `${uid}`,
+    { uid: true, source: true, flags: true, internalDate: true },
+    { uid: true },
+  );
+  if (!msg || !msg.source) throw notFound();
+  // \Recent belongs to the server's session state; APPEND may not set it.
+  const flags = [...(msg.flags ?? [])].filter((f) => f !== "\\Recent");
+  const appended = await client.append(destName, msg.source, flags.length ? flags : undefined, msg.internalDate);
+  if (!appended) throw new JmapError("serverFail", `MOVE to "${destName}" failed, and so did APPEND`);
+  if (!(await client.messageDelete(`${uid}`, { uid: true }))) {
+    throw new JmapError("serverFail", `copied to "${destName}" but could not remove the original`);
+  }
 }
 
 function referencedBlobIds(create: JmapEmailCreate): Set<string> {
