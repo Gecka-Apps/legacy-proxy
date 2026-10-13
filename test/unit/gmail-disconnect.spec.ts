@@ -43,6 +43,20 @@ it("revokes the grant and deletes every row stored for the account", async () =>
   store.rememberDraft(email, "orig", "draft1");
   store.beginSubmission(email, "orig", "fingerprint");
   store.watchSave(email, Date.now() + 60_000, "7");
+  const sub = (id: string, owner: string) =>
+    store.subscribe({
+      id,
+      email: owner,
+      device: "phone",
+      url: "https://relay.example/" + id,
+      types: null,
+      expires: Date.now() + 60_000,
+      code: null,
+      createdAt: Date.now(),
+      emailPush: null,
+    });
+  sub("gone", email);
+  sub("stays", kept);
   const revokeToken = vi.fn(async () => ({}));
   const connection = new GmailConnection(
     { allowedEmails: new Set([email]) } as any,
@@ -58,6 +72,9 @@ it("revokes the grant and deletes every row stored for the account", async () =>
   expect(store.draft(email, "orig")).toBeNull();
   expect(store.submission(email, "orig")).toBeNull();
   expect(store.watch(email)).toBeNull();
+  expect(store.subscriptions(email)).toEqual([]);
+  expect(store.subscription("gone")).toBeNull();
+  expect(store.subscription("stays")).not.toBeNull();
   expect(store.hasConnection(kept)).toBe(true);
   expect(store.authenticate(keptPassword)).toBe(kept);
 });

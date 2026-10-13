@@ -506,7 +506,7 @@ export class GmailStore {
       )
       .run(email, original);
   }
-  /** Deletes everything stored for an account: grant, bridge password, sign-in tokens, cache, drafts, send ledger and queues. */
+  /** Deletes everything stored for an account: grant, bridge password, sign-in tokens, cache, drafts, send ledger, queues and push subscriptions. */
   disconnect(email: string): void {
     const tables = [
       "gmail_connection",
@@ -522,6 +522,7 @@ export class GmailStore {
       "gmail_schedule",
       "gmail_watch",
       "gmail_push",
+      "gmail_push_sub",
     ];
     this.db.transaction(() => {
       for (const table of tables)
