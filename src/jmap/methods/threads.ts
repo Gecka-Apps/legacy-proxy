@@ -2,11 +2,11 @@
 //
 // Threading metadata (Message-ID / In-Reply-To / References → threadId) is
 // immutable per (mailbox, uidvalidity, uid), so it lives in the email_cache
-// table and is maintained incrementally: each build SELECTs every non-empty
-// folder, compares (uidvalidity, uidNext, exists) against the last scan, and
-// only FETCHes headers for UIDs that arrived since. The steady state — nothing
-// changed — costs one SELECT per folder and zero FETCHes; the full-account
-// header scan happens exactly once per account lifetime.
+// table and is maintained incrementally: each build LISTs the folders with
+// their STATUS, SELECTs only those whose (uidvalidity, uidNext, messages) moved
+// since the last scan, and only FETCHes headers for UIDs that arrived since.
+// The steady state — nothing changed — costs one LIST and zero SELECTs; the
+// full-account header scan happens exactly once per account lifetime.
 
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
@@ -16,7 +16,7 @@ import { decodeEmailState, encodeEmailState } from "../../state/states.js";
 import { accountNotFound, cannotCalculateChanges } from "../errors.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
-import { listMailboxes } from "./mailbox.js";
+import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
 import { THREAD_HEADER_FIELDS } from "../../imap/fetcher.js";
 import { log } from "../../util/log.js";
@@ -61,6 +61,15 @@ interface CachedIndex {
 
 const indexCache = new Map<number, CachedIndex>();
 const INDEX_TTL_MS = 5_000;
+const inflight = new Map<number, Promise<ThreadIndex>>();
+
+// Nothing arrived and nothing was expunged since the folder was last scanned.
+export function sameAsLastScan(
+  live: LiveMailboxStatus,
+  scan: { uidvalidity: number; uidnext: number; messages: number },
+): boolean {
+  return live.uidValidity === scan.uidvalidity && live.uidNext === scan.uidnext && live.messages === scan.messages;
+}
 
 // Bring the email_cache rows for one folder up to date with the live mailbox.
 // Assumes the mailbox is already SELECTed on `client`.
@@ -183,6 +192,28 @@ export async function buildThreadIndex(
     return cached.index;
   }
 
+  // One build per account at a time: a request that arrives mid-build waits
+  // for it rather than walking the same folders again on another connection.
+  const running = inflight.get(ctx.account.id);
+  if (running) {
+    await running.catch(() => {});
+    return buildThreadIndex(ctx, opts);
+  }
+  const build = rebuildThreadIndex(ctx, wantFlags, curState, now);
+  inflight.set(ctx.account.id, build);
+  try {
+    return await build;
+  } finally {
+    inflight.delete(ctx.account.id);
+  }
+}
+
+async function rebuildThreadIndex(
+  ctx: ThreadCtx,
+  wantFlags: boolean,
+  curState: number,
+  now: number,
+): Promise<ThreadIndex> {
   // Long scans ride the bulk connection so they don't queue behind (or hold
   // up) interactive method calls sharing the request-path connection. The
   // lease is held for the whole scan and returned however this exits.
@@ -190,7 +221,11 @@ export async function buildThreadIndex(
   const client = lease ? lease.client : ctx.client;
   try {
 
-    const all = await listMailboxes(client, ctx.account, ctx.store);
+    // A fresh LIST reports every folder's UIDVALIDITY, UIDNEXT and count in one
+    // round trip (LIST-STATUS); only folders where those moved get SELECTed.
+    // Before, each build SELECTed every non-empty folder, and on Gmail, where
+    // every label is a folder, that alone took tens of seconds.
+    const all = await listMailboxes(client, ctx.account, ctx.store, { force: true });
     const rows = ctx.store
       .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
       .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
@@ -201,10 +236,11 @@ export async function buildThreadIndex(
       const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
       const row = rowById.get(mailboxIdx);
       if (!row) continue;
-      // Skip folders that are empty and known-empty: no SELECT round trip. The
-      // mailbox list carries STATUS counts (≤30s stale, same as before).
       const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
       if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
+      // Flags are mutable and not in the scan, so a flags build still reads them.
+      const live = liveMailboxStatus(ctx.account.id, row.name);
+      if (!wantFlags && live && scan && sameAsLastScan(live, scan)) continue;
       try {
         await withMailbox(client, row.name, async () => {
           await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
