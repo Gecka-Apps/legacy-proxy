@@ -96,8 +96,9 @@ async function syncMailboxScan(
       { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
       { uid: true },
     )) {
-      // `${x}:*` returns the highest-UID message even when x exceeds it.
-      if (msg.uid == null || msg.uid < startUid) continue;
+      // `${x}:*` returns the highest-UID message even when x exceeds it. A
+      // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
+      if (msg.uid == null || msg.uid < startUid || !msg.envelope) continue;
       const hb =
         typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
       const headers = parseHeaderBlock(hb);
@@ -134,7 +135,7 @@ async function syncMailboxScan(
         gaps,
         { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
       )) {
-        if (msg.uid == null) continue;
+        if (msg.uid == null || !msg.envelope) continue;
         const hb =
           typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
         const headers = parseHeaderBlock(hb);
