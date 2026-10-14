@@ -25,6 +25,14 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
     auth,
     logger: imapflowLogger,
   });
+  // imapflow reports a socket timeout or reset as an 'error' event, and an
+  // EventEmitter with no listener throws it from a timer: an uncaught
+  // exception with no frame of ours in it (#25). The pool and the IDLE worker
+  // add listeners that act on the error; this one only keeps every client,
+  // the short-lived auth probes included, from having none.
+  client.on("error", (err: unknown) => {
+    log.debug({ host: provider.imap.host, ...imapErrorDetails(err) }, "imap connection error");
+  });
   await client.connect();
   log.debug({ host: provider.imap.host, mech: creds.mech }, "imap connected");
   return client;
