@@ -281,19 +281,25 @@ export class CalDavClient {
 
   // -- writes ---------------------------------------------------------------
 
-  async putResource(href: string, ics: string, opts: { ifMatch?: string | null } = {}): Promise<{ etag: string | null }> {
+  async putResource(
+    href: string,
+    ics: string,
+    opts: { ifMatch?: string | null; scheduleReply?: boolean } = {},
+  ): Promise<{ etag: string | null }> {
     const headers: Record<string, string> = { "Content-Type": "text/calendar; charset=utf-8" };
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
     else headers["If-None-Match"] = "*";
+    if (opts.scheduleReply === false) headers["Schedule-Reply"] = "F";
     const res = await this.raw("PUT", href, ics, headers);
     if (res.status === 412) throw new CalDavConflict(href);
     if (!res.ok) throw await httpError("PUT", href, res);
     return { etag: res.headers.get("etag") };
   }
 
-  async deleteResource(href: string, opts: { ifMatch?: string | null } = {}): Promise<void> {
+  async deleteResource(href: string, opts: { ifMatch?: string | null; scheduleReply?: boolean } = {}): Promise<void> {
     const headers: Record<string, string> = {};
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+    if (opts.scheduleReply === false) headers["Schedule-Reply"] = "F";
     const res = await this.raw("DELETE", href, null, headers);
     if (res.status === 412) throw new CalDavConflict(href);
     if (!res.ok && res.status !== 404) throw await httpError("DELETE", href, res);

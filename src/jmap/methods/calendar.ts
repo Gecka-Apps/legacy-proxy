@@ -33,7 +33,7 @@ import { applyPatch } from "./contacts.js";
 import { readBlob } from "../blobs.js";
 import { planScheduling, sendScheduling, type ImipMessage } from "../../caldav/imip.js";
 import { log } from "../../util/log.js";
-import { DEFAULT_COLLECTION, davFlavor } from "../../util/dav-flavor.js";
+import { DEFAULT_COLLECTION, SERVER_SCHEDULING, davFlavor } from "../../util/dav-flavor.js";
 
 export interface CalendarCtx {
   account: AccountRow;
@@ -712,11 +712,16 @@ export async function calendarEventSet(
   if (args.ifInState != null && args.ifInState !== oldState) throw new JmapError("stateMismatch");
   const out = emptySet<JsonObject>(args.accountId, oldState);
   // iMIP messages owed for the writes that succeeded; sent once the CalDAV
-  // side is done so a mail failure can never fail the write itself.
+  // side is done so a mail failure can never fail the write itself. A server
+  // that schedules on its own sends them instead, and is told to hold back
+  // when the client asked for no messages.
+  const serverSchedules = SERVER_SCHEDULING[davFlavor(ctx.provider.caldav)];
+  const proxySchedules = !serverSchedules && args.sendSchedulingMessages === true;
+  const scheduleReply = serverSchedules ? args.sendSchedulingMessages === true : undefined;
   const scheduling: ImipMessage[] = [];
   const me = accountEmail(ctx.account);
   const schedule = (before: JsonObject | null, after: JsonObject | null) => {
-    if (args.sendSchedulingMessages !== true) return;
+    if (!proxySchedules) return;
     scheduling.push(...planScheduling({ me, meName: ctx.store.getIdentitySettings(ctx.account.id).displayName, before, after }));
   };
 
@@ -745,7 +750,7 @@ export async function calendarEventSet(
       input["uid"] = uid;
       const ics = serializeEvent(input);
       const resourceHref = `${picked.cal.href}${crypto.randomUUID()}.ics`;
-      await client.putResource(resourceHref, ics);
+      await client.putResource(resourceHref, ics, { scheduleReply });
       const id = eventId(picked.cal.href, resourceHref);
       const { utcStart, utcEnd } = utcBounds(input, null);
       (out.created ??= {})[tempId] = { id, uid, baseEventId: id, isDraft: false, isOrigin: true, utcStart, utcEnd };
@@ -808,7 +813,7 @@ export async function calendarEventSet(
       draft["uid"] = current.event.uid;
       draft["sequence"] = (Number(current.event.sequence) || 0) + 1;
       const ics = serializeEvent(draft, { preserveFrom: current.raw });
-      await client.putResource(parts.resourceHref, ics, { ifMatch: existing.etag });
+      await client.putResource(parts.resourceHref, ics, { ifMatch: existing.etag, scheduleReply });
       (out.updated ??= {})[id] = null;
       schedule(current.event, draft);
     } catch (e) {
@@ -831,11 +836,11 @@ export async function calendarEventSet(
         continue;
       }
       let before: LoadedEvent | null = null;
-      if (args.sendSchedulingMessages === true) {
+      if (proxySchedules) {
         const [existing] = await client.multiGet(cal.href, [parts.resourceHref]);
         before = existing ? loadResource(cal.href, existing) : null;
       }
-      await client.deleteResource(parts.resourceHref);
+      await client.deleteResource(parts.resourceHref, { scheduleReply });
       (out.destroyed ??= []).push(id);
       if (before) schedule(before.event, null);
     } catch (e) {

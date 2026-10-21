@@ -161,7 +161,11 @@ Backends:
   attendees and on destroy; as attendee, `REPLY` to the organizer when the
   user's own `participationStatus` changes. Participants with
   `scheduleAgent: "client"` / `"none"` are skipped. A mail failure is logged
-  and never fails the calendar write.
+  and never fails the calendar write. On the `nextcloud` and `stalwart`
+  flavors the server schedules by itself (RFC 6638) and the proxy sends
+  nothing; a write without `sendSchedulingMessages: true` carries
+  `Schedule-Reply: F`, which Nextcloud honours on create, update and destroy
+  and Stalwart on destroy only.
 
 Auth and storage:
 
@@ -768,7 +772,9 @@ that, Nextcloud with an LDAP backend shared with the mail server too).
 `nextcloud` or `stalwart`, and settles what the RFCs leave open: the
 collection a new account gets, taken as the default one until the account
 picks another (`contacts` and `calendar`, `contacts` and `personal`,
-`default` and `default`), and the vCard forms the server stores intact.
+`default` and `default`), who delivers invitations (the proxy over SMTP, or
+the server itself on `nextcloud` and `stalwart`), and the vCard forms the
+server stores intact.
 Radicale rewrites every card through vobject, which cuts a value at its first
 unescaped comma, so `radicale` text-escapes URIs and writes inline photos,
 logos, sounds and keys as `ENCODING=b` binaries; the other flavors get the
