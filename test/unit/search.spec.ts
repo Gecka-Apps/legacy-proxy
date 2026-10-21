@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileFilter, UnsupportedFilter } from "../../src/imap/search.js";
+import { compileFilter } from "../../src/imap/search.js";
 
 describe("Email/query filter compiler", () => {
   it("compiles a leaf condition", () => {
@@ -30,9 +30,14 @@ describe("Email/query filter compiler", () => {
     expect(
       compileFilter({
         operator: "AND",
-        conditions: [{ from: "alice@example.com" }, { hasKeyword: "$flagged" }],
+        conditions: [{ from: "alice@example.com" }, { hasKeyword: "$label:red" }],
       }),
-    ).toEqual({ from: "alice@example.com", keyword: "\\Flagged" });
+    ).toEqual({ from: "alice@example.com", keyword: "$label:red" });
+  });
+  it("searches system keywords with their own criteria, not KEYWORD", () => {
+    // Dovecot refuses KEYWORD \Flagged: the system flags are not keywords there.
+    expect(compileFilter({ hasKeyword: "$flagged" })).toEqual({ flagged: true });
+    expect(compileFilter({ notKeyword: "$seen" })).toEqual({ unseen: true });
   });
   it("compiles OR", () => {
     const r = compileFilter({
@@ -41,8 +46,9 @@ describe("Email/query filter compiler", () => {
     }) as { or: unknown[] };
     expect(r.or).toHaveLength(2);
   });
-  it("rejects hasAttachment when backend lacks support", () => {
-    expect(() => compileFilter({ hasAttachment: true })).toThrow(UnsupportedFilter);
+  it("leaves hasAttachment out of the IMAP search, Email/query filters on the structure", () => {
+    expect(compileFilter({ hasAttachment: true })).toEqual({});
+    expect(compileFilter({ hasAttachment: true }, { dialect: "gmail" })).toEqual({ gmraw: "has:attachment" });
   });
   it("routes Gmail text through X-GM-RAW", () => {
     expect(compileFilter({ text: "tax 2024" }, { dialect: "gmail" })).toEqual({
