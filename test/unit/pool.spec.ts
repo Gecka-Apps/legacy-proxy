@@ -53,7 +53,8 @@ import type { AppConfig } from "../../src/util/config.js";
 
 const account = { id: 1, slug: "test:u", kind: "test", vault: Buffer.alloc(0) } as AccountRow;
 const cfg = { vaultKey: Buffer.alloc(32) } as AppConfig;
-const store = {} as Store;
+let emailState = 0;
+const store = { getState: () => emailState } as unknown as Store;
 
 function makePool() {
   return new ImapPool(cfg, store);
@@ -64,6 +65,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => {
   opened.length = 0;
+  emailState = 0;
 });
 
 describe("ImapPool", () => {
@@ -74,6 +76,20 @@ describe("ImapPool", () => {
 
     expect(a.client).not.toBe(b.client);
     expect(opened).toHaveLength(2);
+  });
+
+  it("syncs a reused connection with NOOP only once the email state moved", async () => {
+    const pool = makePool();
+    (await pool.acquire(account, "interactive")).release();
+    (await pool.acquire(account, "interactive")).release();
+    expect(opened[0]!.noopCalls).toBe(0);
+
+    emailState = 1;
+    (await pool.acquire(account, "interactive")).release();
+    expect(opened[0]!.noopCalls).toBe(1);
+    (await pool.acquire(account, "interactive")).release();
+    expect(opened[0]!.noopCalls).toBe(1);
+    expect(opened).toHaveLength(1);
   });
 
   it("reuses a released connection rather than dialing another", async () => {

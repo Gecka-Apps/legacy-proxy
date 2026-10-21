@@ -14,6 +14,12 @@ interface PoolEntry {
   // per socket, so handing one connection to two concurrent callers would
   // queue them behind each other — exactly what the pool exists to avoid.
   busy: boolean;
+  /**
+   * The account's email state when this session last synced its mailbox view.
+   * Dovecot shows a session mail added through another connection only once
+   * it syncs, so a connection lent after the state moved gets a NOOP first.
+   */
+  emailState: number;
 }
 
 // Skip the sanity-NOOP if the connection was used within this window.
@@ -129,9 +135,11 @@ export class ImapPool {
       entry.busy = true;
       const idleMs = Date.now() - entry.lastUsed;
       entry.lastUsed = Date.now();
-      if (idleMs < NOOP_FRESHNESS_MS) return entry;
+      const emailState = this.store.getState(account.id, "email");
+      if (idleMs < NOOP_FRESHNESS_MS && entry.emailState === emailState) return entry;
       try {
         await entry.client.noop();
+        entry.emailState = emailState;
         return entry;
       } catch {
         // Dead despite looking usable; drop it and keep looking.
@@ -145,6 +153,7 @@ export class ImapPool {
 
     // The slot is taken from here on, synchronously, before the first await.
     this.opening.set(key, inFlight + 1);
+    const emailState = this.store.getState(account.id, "email");
     let client: ImapFlow;
     try {
       const provider = resolveProvider(this.cfg, account.kind);
@@ -157,7 +166,7 @@ export class ImapPool {
       throw err;
     }
     this.dialDone(key);
-    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
+    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true, emailState };
     this.attach(account, key, entry);
     return entry;
   }
@@ -213,7 +222,7 @@ export class ImapPool {
       client.logout().catch(() => {});
       return;
     }
-    this.attach(account, key, { client, lastUsed: Date.now(), busy: false });
+    this.attach(account, key, { client, lastUsed: Date.now(), busy: false, emailState: this.store.getState(account.id, "email") });
     this.wake(key);
   }
 

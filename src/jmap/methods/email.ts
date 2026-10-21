@@ -528,9 +528,6 @@ async function emailQuerySingleMailboxFull(
       uids = cached.uids;
     }
     if (!uids) {
-      // A pooled connection sees mail delivered since its last command only
-      // once the server syncs its view, which NOOP asks for (RFC 3501 6.1.2).
-      await ctx.client.noop();
       const searchResult = await ctx.client.search(imapFilter, { uid: true });
       uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
       searchCache.set(cacheKey, {
@@ -665,7 +662,6 @@ async function emailQueryAccountWideFull(
         uids = cached.uids;
       }
       if (!uids) {
-        await client.noop();
         const searchResult = await client.search(imapFilter, { uid: true });
         uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
         searchCache.set(cacheKey, {

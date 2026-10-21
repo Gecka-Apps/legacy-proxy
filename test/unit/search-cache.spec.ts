@@ -1,6 +1,5 @@
 // Email/query reuses an IMAP SEARCH while nothing moved; an arrival seen by
-// the IDLE worker on another connection must still force a new one, run on
-// a view the server has synced first.
+// the IDLE worker on another connection must still force a new one.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -31,17 +30,10 @@ afterEach(() => {
 describe("Email/query search cache", () => {
   it("searches again once the account's email state moved", async () => {
     let uids = [1, 2];
-    const calls: string[] = [];
-    const search = vi.fn(async () => {
-      calls.push("SEARCH");
-      return uids;
-    });
+    const search = vi.fn(async () => uids);
     const client = {
       mailbox: { path: "INBOX", uidValidity: 1n, highestModseq: 7n },
       getMailboxLock: async () => ({ release: () => {} }),
-      noop: async () => {
-        calls.push("NOOP");
-      },
       search,
     };
     const ctx = { account, store, client: client as never };
@@ -55,6 +47,5 @@ describe("Email/query search cache", () => {
     store.bumpState(account.id, "email");
     expect((await emailQuery(args as never, ctx)).ids).toHaveLength(3);
     expect(search).toHaveBeenCalledTimes(2);
-    expect(calls).toEqual(["NOOP", "SEARCH", "NOOP", "SEARCH"]);
   });
 });
