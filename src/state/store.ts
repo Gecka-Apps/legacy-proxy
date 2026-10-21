@@ -313,7 +313,16 @@ export class Store {
     // If the oldest entry's state > sinceState + 1 then we're missing the
     // intermediate ones (got evicted). Conservative: bail.
     if (buf[0]!.state > sinceState + 1) return null;
-    return buf.filter((e) => e.state > sinceState && e.state <= currentState);
+    if (currentState - sinceState > Store.CHANGE_LOG_LIMIT) return null;
+    const entries = buf.filter((e) => e.state > sinceState && e.state <= currentState);
+    // bumpState() alone moves the state without logging what changed (IDLE
+    // arrivals, expunges and flag changes from other clients, submissions),
+    // so every state in the range needs an entry of its own.
+    const logged = new Set(entries.map((e) => e.state));
+    for (let state = sinceState + 1; state <= currentState; state++) {
+      if (!logged.has(state)) return null;
+    }
+    return entries;
   }
 
   bumpState(accountId: number, kind: string): number {
