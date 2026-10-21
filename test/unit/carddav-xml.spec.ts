@@ -6,6 +6,8 @@ import {
   hasResourceType,
   pickHref,
   splitProp,
+  currentUserPrivileges,
+  canWriteContent,
 } from "../../src/carddav/client.js";
 
 const MULTISTATUS = `<?xml version="1.0" encoding="utf-8"?>
@@ -100,5 +102,45 @@ describe("CardDAV XML helpers", () => {
   it("leaves a character reference that names no character as written", () => {
     const xml = `<x:r xmlns:x="DAV:"><x:a>x &#x110000; &#1114112; &#xD800; &#0; &#99999999999999999999; y</x:a></x:r>`;
     expect(textOf(xml, "a")).toBe("x &#x110000; &#1114112; &#xD800; &#0; &#99999999999999999999; y");
+  });
+});
+
+describe("current-user-privilege-set", () => {
+  // Sabre (Nextcloud) for the birthday calendar: readable, renamable, no
+  // write-content.
+  const READ_ONLY = `<d:response><d:href>/remote.php/dav/calendars/u/contact_birthdays/</d:href><d:propstat><d:prop>
+    <d:current-user-privilege-set>
+      <d:privilege><d:read/></d:privilege>
+      <d:privilege><cal:read-free-busy/></d:privilege>
+      <d:privilege><d:write-properties/></d:privilege>
+    </d:current-user-privilege-set>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+  // Radicale for a writable collection: no bind.
+  const RADICALE = `<D:response><D:href>/u/calendar/</D:href><D:propstat><D:prop>
+    <D:current-user-privilege-set><D:privilege><D:read /></D:privilege><D:privilege><D:all /></D:privilege>
+    <D:privilege><D:write /></D:privilege><D:privilege><D:write-properties /></D:privilege>
+    <D:privilege><D:write-content /></D:privilege></D:current-user-privilege-set>
+  </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+  const NOT_FOUND = `<D:response><D:href>/u/calendar/</D:href><D:propstat><D:prop>
+    <D:current-user-privilege-set/>
+  </D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response>`;
+
+  it("lists the privileges by local name, whatever the prefix", () => {
+    expect(currentUserPrivileges(READ_ONLY)).toEqual(["read", "read-free-busy", "write-properties"]);
+    expect(currentUserPrivileges(RADICALE)).toEqual(["read", "all", "write", "write-properties", "write-content"]);
+  });
+
+  it("is null when the property is absent or answered 404", () => {
+    expect(currentUserPrivileges(MULTISTATUS)).toBeNull();
+    expect(currentUserPrivileges(NOT_FOUND)).toBeNull();
+  });
+
+  it("allows writing on write-content, write or all, and when nothing is known", () => {
+    expect(canWriteContent(currentUserPrivileges(READ_ONLY))).toBe(false);
+    expect(canWriteContent(currentUserPrivileges(RADICALE))).toBe(true);
+    expect(canWriteContent(["read", "write-content"])).toBe(true);
+    expect(canWriteContent(["read", "write"])).toBe(true);
+    expect(canWriteContent(["all"])).toBe(true);
+    expect(canWriteContent(null)).toBe(true);
   });
 });

@@ -15,7 +15,7 @@
 import crypto from "node:crypto";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { Buffer } from "node:buffer";
-import { CardDavClient, davOptions, CardDavConflict, type AddressBookInfo } from "../../carddav/client.js";
+import { CardDavClient, davOptions, CardDavConflict, canWriteContent, type AddressBookInfo } from "../../carddav/client.js";
 import { parseVCards, serializeVCard, type JsContact } from "../../carddav/vcard.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
@@ -102,6 +102,7 @@ function splitCardId(id: string): { bookHref: string; resourceHref: string } | n
 }
 
 function projectAddressBook(b: AddressBookInfo, isDefault: boolean): AddressBookJson {
+  const write = canWriteContent(b.privileges);
   return {
     id: bookId(b.href),
     name: b.displayName,
@@ -109,7 +110,7 @@ function projectAddressBook(b: AddressBookInfo, isDefault: boolean): AddressBook
     sortOrder: 0,
     isDefault,
     isSubscribed: true,
-    myRights: { mayRead: true, mayWrite: true, mayShare: false, mayDelete: true },
+    myRights: { mayRead: true, mayWrite: write, mayShare: false, mayDelete: write },
   };
 }
 
@@ -117,19 +118,22 @@ const PREF_DEFAULT_BOOK = "addressbook:default";
 
 /**
  * The book flagged isDefault and used when a card is created without an
- * addressBookIds. The account's stored choice wins as long as that book still
- * exists; otherwise the collection the server sets up for a new account (per DAV flavor),
- * otherwise the first by href. CardDAV has no default-book property and the
- * server lists collections in directory order, so nothing here relies on the
- * order of the PROPFIND response.
+ * addressBookIds. Only books the user can write into are candidates, unless
+ * there are none. Among them, the account's stored choice wins as long as that
+ * book still exists; otherwise the collection the server sets up for a new
+ * account (per DAV flavor), otherwise the first by href. CardDAV has no
+ * default-book property and the server lists collections in directory order,
+ * so nothing here relies on the order of the PROPFIND response.
  */
 function defaultBook(ctx: ContactCtx, books: AddressBookInfo[]): AddressBookInfo | undefined {
-  if (books.length === 0) return undefined;
+  const writable = books.filter((b) => canWriteContent(b.privileges));
+  const pool = writable.length > 0 ? writable : books;
+  if (pool.length === 0) return undefined;
   const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_BOOK);
-  const chosen = pref ? books.find((b) => bookId(b.href) === pref) : undefined;
+  const chosen = pref ? pool.find((b) => bookId(b.href) === pref) : undefined;
   if (chosen) return chosen;
   const slug = DEFAULT_COLLECTION[davFlavor(ctx.provider.carddav)].addressBook;
-  return books.find((b) => leaf(b.href) === slug) ?? [...books].sort((a, b) => a.href.localeCompare(b.href))[0];
+  return pool.find((b) => leaf(b.href) === slug) ?? [...pool].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 function bookState(b: AddressBookInfo): string {
@@ -624,7 +628,7 @@ export async function addressBookSet(
       const home = await client.addressBookHome();
       const href = `${home}${collectionSlug(name, books)}/`;
       await client.makeAddressBook(href, { displayName: name, description });
-      const info: AddressBookInfo = { href, displayName: name, description, ctag: null };
+      const info: AddressBookInfo = { href, displayName: name, description, ctag: null, privileges: null };
       books = [...books, info];
       const projected = projectAddressBook(info, defaultBook(ctx, books) === info);
       const { name: _n, ...serverSet } = projected;
@@ -699,9 +703,10 @@ export async function addressBookSet(
   }
 
   // RFC 9610 §2.3: applied only when every create, update and destroy went
-  // through; an id that matches nothing is ignored, not an error. A `#tempId`
-  // names a book created above. The books whose isDefault flips are reported
-  // back with the server-set value.
+  // through; an id that matches nothing is ignored, not an error, and so is a
+  // book the user cannot write into. A `#tempId` names a book created above.
+  // The books whose isDefault flips are reported back with the server-set
+  // value.
   if (args.onSuccessSetIsDefault != null && !out.notCreated && !out.notUpdated && !out.notDestroyed) {
     let wanted = args.onSuccessSetIsDefault;
     let createdAs: string | null = null;
@@ -709,7 +714,7 @@ export async function addressBookSet(
       createdAs = wanted.slice(1);
       wanted = out.created?.[createdAs]?.id ?? "";
     }
-    const target = books.find((b) => bookId(b.href) === wanted);
+    const target = books.find((b) => bookId(b.href) === wanted && canWriteContent(b.privileges));
     if (target) {
       ctx.store.setPref(ctx.account.id, PREF_DEFAULT_BOOK, wanted);
       const created = createdAs ? out.created?.[createdAs] : undefined;
