@@ -457,4 +457,86 @@ const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
       }
     });
   });
+
+  describe("invitations", () => {
+    const meeting = (uid: string, calId: string) => ({
+      calendarIds: { [calId]: true },
+      uid,
+      title: `Point ${RUN}`,
+      start: "2031-05-06T10:00:00",
+      duration: "PT1H",
+      timeZone: "Pacific/Noumea",
+      replyTo: { imip: "mailto:alice@example.test" },
+      participants: {
+        a: { "@type": "Participant", email: "alice@example.test", roles: { owner: true, attendee: true }, participationStatus: "accepted" },
+        b: { "@type": "Participant", email: "bob@example.test", roles: { attendee: true }, participationStatus: "needs-action", expectReply: true },
+      },
+    });
+
+    /** Bob's copy of the meeting, as Nextcloud's local delivery left it. */
+    async function bobCopy(uid: string): Promise<Record<string, any> | undefined> {
+      resetCalDavCaches();
+      const found = await calendarEventQuery(
+        { accountId: "2", filter: { after: "2031-05-06T00:00:00", before: "2031-05-07T00:00:00" }, timeZone: "Pacific/Noumea" },
+        bob,
+      );
+      const events = (await calendarEventGet({ accountId: "2", ids: found.ids }, bob)).list as Record<string, any>[];
+      return events.find((e) => e.uid === uid);
+    }
+
+    async function dropBobCopy(uid: string) {
+      const copy = await bobCopy(uid);
+      if (copy) await davAs("bob", "DELETE", hrefOf(copy.id as string), undefined, { "Schedule-Reply": "F" });
+    }
+
+    let calId: string;
+    beforeEach(async () => {
+      calId = (await calendarGet({ accountId: "1", ids: null }, alice)).list.find((c) => c.isDefault)!.id as string;
+    });
+
+    it("lets Nextcloud deliver the invitation, the update and the cancellation", async () => {
+      const uid = `${RUN}-invite@test`;
+      const res = await calendarEventSet({ accountId: "1", create: { e: meeting(uid, calId) }, sendSchedulingMessages: true }, alice);
+      expect(res.notCreated).toBeNull();
+      const id = res.created!.e!.id as string;
+      try {
+        expect(await bobCopy(uid)).toMatchObject({ title: `Point ${RUN}` });
+
+        await calendarEventSet({ accountId: "1", update: { [id]: { title: `Point déplacé ${RUN}` } }, sendSchedulingMessages: true }, alice);
+        expect(await bobCopy(uid)).toMatchObject({ title: `Point déplacé ${RUN}` });
+
+        const gone = await calendarEventSet({ accountId: "1", destroy: [id], sendSchedulingMessages: true }, alice);
+        expect(gone.destroyed).toEqual([id]);
+        expect(await bobCopy(uid)).toMatchObject({ status: "cancelled" });
+      } finally {
+        await calendarEventSet({ accountId: "1", destroy: [id] }, alice);
+        await dropBobCopy(uid);
+      }
+    });
+
+    it("keeps Nextcloud quiet when the client asks for no messages", async () => {
+      const silent = `${RUN}-silent@test`;
+      const quiet = await calendarEventSet({ accountId: "1", create: { e: meeting(silent, calId) } }, alice);
+      expect(quiet.notCreated).toBeNull();
+      await calendarEventSet({ accountId: "1", destroy: [quiet.created!.e!.id as string] }, alice);
+      expect(await bobCopy(silent)).toBeUndefined();
+
+      const uid = `${RUN}-held@test`;
+      const res = await calendarEventSet({ accountId: "1", create: { e: meeting(uid, calId) }, sendSchedulingMessages: true }, alice);
+      const id = res.created!.e!.id as string;
+      try {
+        expect(await bobCopy(uid)).toMatchObject({ title: `Point ${RUN}` });
+
+        await calendarEventSet({ accountId: "1", update: { [id]: { title: `Note privée ${RUN}` } }, sendSchedulingMessages: false }, alice);
+        expect(await bobCopy(uid)).toMatchObject({ title: `Point ${RUN}` });
+
+        const gone = await calendarEventSet({ accountId: "1", destroy: [id] }, alice);
+        expect(gone.destroyed).toEqual([id]);
+        expect((await bobCopy(uid))?.status).not.toBe("cancelled");
+      } finally {
+        await calendarEventSet({ accountId: "1", destroy: [id] }, alice);
+        await dropBobCopy(uid);
+      }
+    });
+  });
 });

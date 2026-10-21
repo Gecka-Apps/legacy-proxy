@@ -48,7 +48,7 @@ const PRINCIPAL = "/principals/u/";
 
 class FakeDav {
   cals = new Map<string, Cal>();
-  calls: Array<{ method: string; path: string; body: string }> = [];
+  calls: Array<{ method: string; path: string; body: string; headers: Record<string, string> }> = [];
   private etagSeq = 0;
 
   addCalendar(slug: string, displayName: string, items: Array<[string, string]> = [], components = ["VEVENT"]): string {
@@ -65,7 +65,7 @@ class FakeDav {
 
   handle(method: string, url: string, headers: Record<string, string>, body: string): Response {
     const path = decodeURIComponent(new URL(url).pathname);
-    this.calls.push({ method, path, body });
+    this.calls.push({ method, path, body, headers });
     if (headers["authorization"] !== "Basic " + Buffer.from("u:p").toString("base64")) return new Response("nope", { status: 401 });
     switch (method) {
       case "PROPFIND":
@@ -560,6 +560,44 @@ describe("CalendarEvent/set scheduling", () => {
     dav.addCalendar("work", "Work");
     await calendarEventSet({ accountId: "7", create: { n: withBob } }, ctx);
     expect(sent).toHaveLength(0);
+    expect(dav.calls.find((c) => c.method === "PUT")?.headers["schedule-reply"]).toBeUndefined();
+  });
+
+  describe("on a server that schedules itself", () => {
+    const writes = () => dav.calls.filter((c) => c.method === "PUT" || c.method === "DELETE");
+
+    for (const flavor of ["nextcloud", "stalwart"] as const) {
+      it(`${flavor}: leaves the messages to the server when asked to send them`, async () => {
+        const on = { ...ctx, provider: { ...provider, caldav: { ...provider.caldav!, flavor } } };
+        dav.addCalendar("work", "Work");
+        const r = await calendarEventSet({ accountId: "7", create: { n: withBob }, sendSchedulingMessages: true }, on);
+        const id = r.created!.n.id as string;
+        await calendarEventSet({ accountId: "7", update: { [id]: { title: "Kickoff v2" } }, sendSchedulingMessages: true }, on);
+        await calendarEventSet({ accountId: "7", destroy: [id], sendSchedulingMessages: true }, on);
+        expect(sent).toHaveLength(0);
+        expect(writes().map((c) => [c.method, c.headers["schedule-reply"]])).toEqual([
+          ["PUT", undefined],
+          ["PUT", undefined],
+          ["DELETE", undefined],
+        ]);
+      });
+    }
+
+    it("asks the server to hold back when the client wants no messages", async () => {
+      const on = { ...ctx, provider: { ...provider, caldav: { ...provider.caldav!, flavor: "nextcloud" as const } } };
+      dav.addCalendar("work", "Work");
+      const r = await calendarEventSet({ accountId: "7", create: { n: withBob } }, on);
+      const id = r.created!.n.id as string;
+      await calendarEventSet({ accountId: "7", update: { [id]: { title: "Kickoff v2" } }, sendSchedulingMessages: false }, on);
+      await calendarEventSet({ accountId: "7", destroy: [id] }, on);
+      expect(sent).toHaveLength(0);
+      expect(writes().map((c) => [c.method, c.headers["schedule-reply"]])).toEqual([
+        ["PUT", "F"],
+        ["PUT", "F"],
+        ["DELETE", "F"],
+      ]);
+      expect(writes()[0]!.body).not.toContain("SCHEDULE-AGENT");
+    });
   });
 });
 
