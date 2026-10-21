@@ -15,6 +15,7 @@ describe("flags ↔ keywords", () => {
   it("preserves user-defined flags case-insensitively", () => {
     expect(flagToKeyword("MyLabel")).toBe("mylabel");
     expect(keywordToFlag("mylabel")).toBe("mylabel");
+    expect(keywordToFlag("$label:pink")).toBe("$label:pink");
   });
   it("accepts every atom character, the colon of Bulwark labels included", () => {
     expect(keywordToFlag("$label:red")).toBe("$label:red");

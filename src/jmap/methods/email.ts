@@ -11,11 +11,11 @@ import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search
 import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
-import { projectHeaderProp } from "../../imap/headers.js";
+import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import { unescapePointerToken } from "../refs.js";
-import { buildRfc822, collectBlobIds, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import { readBlob } from "../blobs.js";
 import {
   changesFromLog,
@@ -429,7 +429,7 @@ async function postFilterByHasAttachment(
     const missingUids: number[] = [];
     for (const [uid, eid] of uidByEid) {
       const cached = cachedRows.get(uid);
-      if (cached?.bodystructure != null) {
+      if (cached?.bodystructure != null && cached.bodystructure !== "null") {
         try {
           const has = bodyStructureHasAttachment(JSON.parse(cached.bodystructure));
           if (has === want) keep.add(eid);
@@ -445,7 +445,8 @@ async function postFilterByHasAttachment(
         for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
           const uid = Number(msg.uid);
           const eid = uidByEid.get(uid);
-          if (!eid) continue;
+          // A FLAGS-only FETCH pushed mid-command has no structure to judge by.
+          if (!eid || !msg.bodyStructure) continue;
           const has = bodyStructureHasAttachment(msg.bodyStructure);
           if (has === want) keep.add(eid);
           upserts.push({
@@ -453,7 +454,7 @@ async function postFilterByHasAttachment(
             mailboxId: mailboxIdx,
             uidvalidity,
             uid,
-            bodystructure: JSON.stringify(msg.bodyStructure ?? null),
+            bodystructure: JSON.stringify(msg.bodyStructure),
           });
         }
         ctx.store.upsertEmailCacheRows(upserts);
@@ -769,11 +770,11 @@ export async function emailGet(
   // list views and saves one IMAP round trip per Email/get page.
   const wantsPreview =
     args.properties === undefined || args.properties.includes("preview");
-  // Only `header:*` projections need the complete header block; everything
-  // else (references, threading) is covered by the threading-field subset,
-  // which is a fraction of the bytes on modern messages.
+  // Only `headers` and `header:*` projections need the complete header block;
+  // everything else (references, threading) is covered by the threading-field
+  // subset, which is a fraction of the bytes on modern messages.
   const needsFullHeaders =
-    args.properties?.some((p) => p.startsWith("header:")) ?? false;
+    args.properties?.some((p) => p === "headers" || p.startsWith("header:")) ?? false;
   const bodyOpts = {
     fetchTextBodyValues: args.fetchTextBodyValues,
     fetchHTMLBodyValues: args.fetchHTMLBodyValues,
@@ -885,6 +886,10 @@ function projectEmailForGet(
     if (p === "id") continue;
     if (p.startsWith("header:")) {
       out[p] = projectHeaderProp(headers, p);
+      continue;
+    }
+    if (p === "headers") {
+      out.headers = headersToEmailHeaders(headers);
       continue;
     }
     // Plain top-level property; copy through if we have it.
@@ -1405,6 +1410,17 @@ export async function applyEmailUpdate(
   });
 }
 
+function referencedBlobIds(create: JmapEmailCreate): Set<string> {
+  const out = new Set<string>();
+  const walk = (p: BodyStructurePart): void => {
+    if (p.blobId) out.add(p.blobId);
+    p.subParts?.forEach(walk);
+  };
+  if (create.bodyStructure) walk(create.bodyStructure);
+  create.attachments?.forEach(walk);
+  return out;
+}
+
 interface CreatedEmailResult {
   id: string;
   blobId: string;
@@ -1456,22 +1472,29 @@ async function applyEmailCreate(
     }
   }
 
-  // Attachments come as uploads or, when forwarding, as parts of a stored
-  // message that readBlob fetches over IMAP. Both are loaded here so the
-  // MIME walk stays synchronous.
-  const create = payload as JmapEmailCreate;
+  // buildRfc822 looks blobs up synchronously, so load them first. Besides
+  // uploads these can be parts of existing mail: a re-opened draft or a
+  // forward references its attachments by their part blobIds.
   const blobs = new Map<string, { body: Buffer; ctype: string }>();
-  for (const blobId of collectBlobIds(create)) {
-    const blob = await readBlob(
-      { account: ctx.account, store: ctx.store, pool: ctx.pool },
-      blobId,
-      MAX_ATTACHMENT_BLOB,
-    );
+  for (const blobId of referencedBlobIds(payload as JmapEmailCreate)) {
+    const blob = await readBlob(blobId, ctx, MAX_ATTACHMENT_BLOB);
     if (blob) blobs.set(blobId, blob);
   }
-  const mime = await buildRfc822(create, ctx.account.host || "localhost", (blobId) =>
-    blobs.get(blobId) ?? null,
-  );
+
+  let mime: Buffer;
+  try {
+    mime = await buildRfc822(
+      payload as JmapEmailCreate,
+      ctx.account.host || "localhost",
+      (blobId) => blobs.get(blobId) ?? null,
+    );
+  } catch (e) {
+    // RFC 8621 §4.6: a part referencing an unknown blob fails the create.
+    if (e instanceof MissingBlobError) {
+      throw new JmapError("blobNotFound", e.message, { notFound: [e.blobId] });
+    }
+    throw e;
+  }
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
   const res = await ctx.client.append(target.name, mime, flags.length ? flags : undefined, idate);

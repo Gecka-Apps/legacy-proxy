@@ -7,8 +7,10 @@ import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mappi
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
 import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
+import { imapErrorDetails } from "./client.js";
 import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
+import { log } from "../util/log.js";
 
 // The header fields threading and the default Email/get property set need:
 // References for threadId + `references`, In-Reply-To / Message-ID as backup.
@@ -321,8 +323,9 @@ async function fetchBodyValuesBatched(
       )) {
         if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
-    } catch {
+    } catch (e) {
       // fall through: members without raw parts get isEncodingProblem below
+      log.warn({ uids: g.members.map((m) => m.uid), partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
     }
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
@@ -405,8 +408,9 @@ async function fetchPreviewsBatched(
         const decoded = decodeTransferEncoding(buf, t.encoding);
         out.set(m.uid, buildPreview(decodePartText(decoded, t.charset), t.isHtml));
       }
-    } catch {
+    } catch (e) {
       // best-effort: leave preview empty (and uncached) for this group
+      log.warn({ partId, uids: group.map((t) => t.uid), ...imapErrorDetails(e) }, "preview FETCH failed");
     }
   }
   return out;
@@ -444,13 +448,17 @@ export async function fetchEmailsBatch(
       (!needsFull || row.headers_full === 1)
     ) {
       try {
+        const envelope = JSON.parse(row.envelope) as EnvelopeLike | null;
+        const bodystructure = JSON.parse(row.bodystructure);
+        // Rows written before the guards above can hold the string "null".
+        if (!envelope || !bodystructure) throw new Error("incomplete cache row");
         raws.set(uid, {
           uid,
           flags: null,
           size: row.size ?? 0,
           internaldate: row.internaldate,
-          envelope: JSON.parse(row.envelope) as EnvelopeLike,
-          bodystructure: JSON.parse(row.bodystructure),
+          envelope,
+          bodystructure,
           headersRaw: Buffer.isBuffer(row.headers_raw) ? row.headers_raw : Buffer.from(row.headers_raw),
           headersFull: row.headers_full === 1,
           preview: row.preview,
@@ -466,7 +474,10 @@ export async function fetchEmailsBatch(
 
   if (missing.length > 0) {
     for await (const m of fetchByUid(client, missing, metaQuery(needsFull))) {
-      if (m.uid == null) continue;
+      // imapflow hands back every untagged FETCH that arrives during the
+      // command, including the FLAGS-only ones a server pushes when another
+      // session changes flags. Those carry no structure; keep the real answer.
+      if (m.uid == null || !m.bodyStructure || !m.envelope) continue;
       raws.set(m.uid, rawFromFetch(m, needsFull));
     }
   }

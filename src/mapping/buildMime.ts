@@ -5,7 +5,6 @@
 // quoted-printable encoding, header folding, and message id generation.
 
 import MimeNode from "nodemailer/lib/mime-node/index.js";
-import { JmapError } from "../jmap/errors.js";
 
 interface JmapAddress {
   name?: string | null;
@@ -22,7 +21,8 @@ interface BodyValue {
 
 // JMAP `bodyStructure` (RFC 8621 §4.1.4): a recursive tree describing the
 // MIME hierarchy. Leaves carry either a partId (resolved through bodyValues)
-// or a blobId (references a previously-uploaded blob).
+// or a blobId (an upload, or a part of existing mail such as a forwarded
+// attachment).
 export interface BodyStructurePart {
   type?: string;
   partId?: string;
@@ -49,8 +49,8 @@ export interface JmapEmailCreate {
   sentAt?: string | null;
   textBody?: BodyPartRef[] | null;
   htmlBody?: BodyPartRef[] | null;
-  // Simple form companion of textBody/htmlBody (RFC 8621 §4.6): leaf parts
-  // by blobId, each with its own type, name, disposition and cid.
+  // RFC 8621 §4.6: with textBody / htmlBody, attachments (inline images with
+  // a cid, and files) are listed here instead of in a bodyStructure.
   attachments?: BodyStructurePart[] | null;
   bodyValues?: Record<string, BodyValue> | null;
   // Headers passed through verbatim (asRaw form). We don't attempt to
@@ -110,67 +110,18 @@ function nodeFromBodyStructure(
     node.setContent(bodyValues[part.partId]!.value!);
   } else if (part.blobId) {
     const blob = getBlob(part.blobId);
-    if (!blob) {
-      throw new JmapError("blobNotFound", `blob ${part.blobId} does not exist`, {
-        notFound: [part.blobId],
-      });
-    }
+    // An empty part would go out as a blank file or a broken inline image;
+    // refuse the message instead.
+    if (!blob) throw new MissingBlobError(part.blobId);
     node.setContent(blob.body);
   }
   return node;
 }
 
-// Simple form (RFC 8621 §4.6): the server derives the MIME tree from
-// textBody, htmlBody and attachments. Text and HTML sit in a
-// multipart/alternative; inline parts referenced from the HTML by cid: are
-// grouped with it in a multipart/related; the remaining attachments hang
-// off a multipart/mixed root, in the order the client listed them.
-function nodeFromSimpleForm(
-  create: JmapEmailCreate,
-  getBlob: BlobLookup,
-  hostname: string,
-): MimeNode {
-  const text = resolveBody(create.textBody, create.bodyValues);
-  const html = resolveBody(create.htmlBody, create.bodyValues);
-  const attachments = (create.attachments ?? []).filter((a) => a.blobId);
-  const related = html
-    ? attachments.filter((a) => a.cid && (a.disposition ?? "inline").toLowerCase() === "inline")
-    : [];
-  const mixed = attachments.filter((a) => !related.includes(a));
-
-  let htmlNode: MimeNode | null = null;
-  if (html) {
-    htmlNode = new MimeNode("text/html; charset=utf-8", { hostname });
-    htmlNode.setContent(html);
-    if (related.length) {
-      const wrap = new MimeNode('multipart/related; type="text/html"', { hostname });
-      wrap.appendChild(htmlNode);
-      for (const a of related) wrap.appendChild(nodeFromBodyStructure(a, null, getBlob, hostname));
-      htmlNode = wrap;
-    }
+export class MissingBlobError extends Error {
+  constructor(readonly blobId: string) {
+    super(`blob ${blobId} not found`);
   }
-
-  let body: MimeNode;
-  if (text && htmlNode) {
-    body = new MimeNode("multipart/alternative", { hostname });
-    body.createChild("text/plain; charset=utf-8").setContent(text);
-    body.appendChild(htmlNode);
-  } else if (htmlNode) {
-    body = htmlNode;
-  } else {
-    body = new MimeNode("text/plain; charset=utf-8", { hostname });
-    body.setContent(text ?? "");
-  }
-
-  if (mixed.length === 0) return body;
-  const root = new MimeNode("multipart/mixed", { hostname });
-  root.appendChild(body);
-  for (const a of mixed) {
-    root.appendChild(
-      nodeFromBodyStructure({ ...a, disposition: a.disposition ?? "attachment" }, null, getBlob, hostname),
-    );
-  }
-  return root;
 }
 
 function resolveBody(
@@ -188,11 +139,35 @@ function resolveBody(
   return chunks.join("\r\n");
 }
 
+// RFC 8621 §4.6: inline parts with a cid sit next to the HTML they are
+// referenced from in a multipart/related; everything else, and inline parts
+// without HTML to show them, goes into a multipart/mixed around that.
+function wrapAttachments(
+  body: MimeNode,
+  attachments: BodyStructurePart[],
+  hasHtml: boolean,
+  getBlob: BlobLookup,
+  hostname: string,
+): MimeNode {
+  const related = hasHtml ? attachments.filter((a) => a.cid && a.disposition === "inline") : [];
+  const mixed = attachments.filter((a) => !related.includes(a));
+  let root = body;
+  for (const [type, parts] of [["multipart/related", related], ["multipart/mixed", mixed]] as const) {
+    if (!parts.length) continue;
+    const wrapper = new MimeNode(type, { hostname });
+    wrapper.appendChild(root);
+    for (const p of parts) {
+      wrapper.appendChild(nodeFromBodyStructure({ ...p, disposition: p.disposition ?? "attachment" }, null, getBlob, hostname));
+    }
+    root = wrapper;
+  }
+  return root;
+}
+
 export interface BlobLookup {
-  // Returns the bytes behind a blobId, or null when there are none: the walk
-  // then fails the create with blobNotFound. The lookup is synchronous for
-  // buildRfc822's MimeNode walk; callers load IMAP-backed blobs beforehand
-  // (see collectBlobIds).
+  // Returns the bytes for a blobId, or null if missing. The lookup is
+  // synchronous for buildRfc822's MimeNode walk; callers load the referenced
+  // blobs up front (some need an IMAP fetch) and answer from those.
   (blobId: string): { body: Buffer; ctype: string } | null;
 }
 
@@ -200,14 +175,33 @@ export async function buildRfc822(
   create: JmapEmailCreate,
   hostname: string,
   getBlob: BlobLookup = () => null,
+  keepBcc = false,
 ): Promise<Buffer> {
   // Choose a root structure based on the inputs we got. Prefer `bodyStructure`
   // (RFC 8621 §4.5.1 form 1) when present — it's the canonical source of
-  // truth and drives multipart/alternative + attachments. Otherwise assemble
-  // the tree from the simpler textBody/htmlBody/attachments form.
-  const root: MimeNode = create.bodyStructure
-    ? nodeFromBodyStructure(create.bodyStructure, create.bodyValues ?? null, getBlob, hostname)
-    : nodeFromSimpleForm(create, getBlob, hostname);
+  // truth and drives multipart/alternative + attachments. Otherwise fall back
+  // to the simpler textBody/htmlBody form.
+  let root: MimeNode;
+  if (create.bodyStructure) {
+    root = nodeFromBodyStructure(create.bodyStructure, create.bodyValues ?? null, getBlob, hostname);
+  } else {
+    const text = resolveBody(create.textBody, create.bodyValues);
+    const html = resolveBody(create.htmlBody, create.bodyValues);
+    if (text && html) {
+      root = new MimeNode("multipart/alternative", { hostname });
+      root.createChild("text/plain; charset=utf-8").setContent(text);
+      root.createChild("text/html; charset=utf-8").setContent(html);
+    } else if (html) {
+      root = new MimeNode("text/html; charset=utf-8", { hostname });
+      root.setContent(html);
+    } else {
+      root = new MimeNode("text/plain; charset=utf-8", { hostname });
+      root.setContent(text ?? "");
+    }
+    root = wrapAttachments(root, create.attachments ?? [], html !== null, getBlob, hostname);
+  }
+
+  root.keepBcc = keepBcc;
 
   const setIfPresent = (header: string, value: string | null): void => {
     if (value) root.setHeader(header, value);
@@ -257,25 +251,16 @@ export async function buildRfc822(
     root.setHeader(h.name, h.value ?? "");
   }
 
+  // MimeNode drops Bcc from the output by default. Keep it: the stored draft
+  // is what EmailSubmission/set derives the envelope from when the client
+  // sends none, and without the header Bcc recipients were silently never
+  // sent to. Submission strips it again before handing the message to SMTP.
+  root.keepBcc = true;
+
   return await new Promise<Buffer>((resolve, reject) => {
     root.build((err: Error | null, message: Buffer) => {
       if (err) reject(err);
       else resolve(message);
     });
   });
-}
-
-// Every blobId a create payload references, bodyStructure leaves and simple
-// form attachments alike, so the caller can load them before the synchronous
-// MIME walk.
-export function collectBlobIds(create: JmapEmailCreate): string[] {
-  const ids = new Set<string>();
-  const walk = (part: BodyStructurePart | null | undefined): void => {
-    if (!part) return;
-    if (part.blobId) ids.add(part.blobId);
-    for (const child of part.subParts ?? []) walk(child);
-  };
-  walk(create.bodyStructure);
-  for (const a of create.attachments ?? []) walk(a);
-  return [...ids];
 }

@@ -13,14 +13,21 @@ import { makeSession, signSession, verifySession } from "./auth/session.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
+import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-import { openImap } from "./imap/client.js";
+import { imapErrorDetails, openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 import { probeSieveCapabilities } from "./sieve/capabilities.js";
 import { fetchScriptBody, scriptNameFromBlobId } from "./jmap/methods/sieve.js";
 import { CalDavClient } from "./caldav/client.js";
 import { CardDavClient } from "./carddav/client.js";
+
+import { loadGmailConfig } from "./gmail/config.js";
+import { GmailStore } from "./gmail/store.js";
+import { GmailConnection } from "./gmail/connection.js";
+import { registerGmailBackend } from "./gmail/backend.js";
+import { registerGmailRoutes } from "./gmail/routes.js";
 
 const cfg = loadConfig();
 const store = new Store(cfg.dataDir);
@@ -52,6 +59,11 @@ const app = Fastify({
   loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
+  // The download URL carries the attachment's file name as a path segment.
+  // Fastify's default cap of 100 characters answers longer ones with a 404,
+  // which a client shows as an empty attached message; percent-encoding
+  // triples non-ASCII names, so leave room for a 255-byte name.
+  routerOptions: { maxParamLength: 1024 },
 });
 
 await app.register(cors, { origin: true });
@@ -60,7 +72,18 @@ await app.register(cors, { origin: true });
 // reply.raw directly, bypassing the onSend hook this plugin uses.
 await app.register(compress, { global: true, threshold: 1024 });
 
-app.get("/healthz", async () => ({ ok: true }));
+const gmailConfig = loadGmailConfig(cfg.publicUrl);
+const gmailStore = gmailConfig ? new GmailStore(cfg.dataDir, cfg.vaultKey) : null;
+// Operational counters only (no addresses, subjects or bodies): pending/uncertain sends are the ones to watch.
+const gmailHooks: { push?: import("./gmail/push.js").GmailPush } = {};
+app.get("/healthz", async () => ({ ok: true, ...(gmailStore && gmailConfig?.schedule ? { gmailSchedule: gmailStore.scheduleStats() } : {}), ...(gmailHooks.push ? { gmailPush: gmailHooks.push.stats() } : {}) }));
+
+if (gmailConfig && gmailStore) {
+  const connection = new GmailConnection(gmailConfig, gmailStore);
+  registerGmailBackend(app, cfg, gmailConfig, gmailStore, connection, gmailHooks);
+  await app.register(registerGmailRoutes, { config: gmailConfig, connection, store: gmailStore, tokens: gmailStore });
+  app.addHook("onClose", async () => gmailStore.close());
+}
 
 app.post("/api/login", async (req, reply) => {
   const body = req.body as {
@@ -150,7 +173,11 @@ app.post("/jmap", async (req, reply) => {
     }
   }
   try {
-    const out = await dispatch(env, { cfg, pool, store, account, dispatcher });
+    const out = await dispatch(env, {
+      methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
+      maxCallsInRequest: cfg.limits.maxCallsInRequest,
+      sessionState: `s${account.id}`,
+    });
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
@@ -273,8 +300,15 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         parsed.partId ?? undefined,
         { uid: true },
       );
-      if (!dl) {
+      // imapflow answers `{}` rather than null when the FETCH came back
+      // without the message or part (expunged, or the server could not
+      // produce it), so check for the stream itself.
+      if (!dl?.content) {
         release();
+        log.warn(
+          { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null },
+          "download: IMAP server returned no content",
+        );
         return reply.code(404).send({ error: "blob not found" });
       }
 
@@ -338,7 +372,10 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       return reply.send(tee);
     } catch (e) {
       release();
-      log.error({ err: (e as Error).message }, "download error");
+      log.error(
+        { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null, ...imapErrorDetails(e) },
+        "download error",
+      );
       return reply.code(502).send({ error: "download failed" });
     }
   },
@@ -582,7 +619,7 @@ async function probeBasicAuth(
 
 const port = cfg.port;
 app
-  .listen({ port, host: "0.0.0.0" })
+  .listen({ port, host: process.env.LISTEN_HOST ?? "0.0.0.0" })
   .then(() => log.info({ port, publicUrl: cfg.publicUrl }, "legacy-proxy listening"))
   .catch((e) => {
     log.fatal({ err: e }, "failed to listen");

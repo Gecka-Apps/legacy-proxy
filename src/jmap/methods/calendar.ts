@@ -893,7 +893,7 @@ export async function calendarEventParse(
   const notParsable: string[] = [];
   const notFound: string[] = [];
   for (const blobId of args.blobIds ?? []) {
-    const blob = await readBlob({ account: ctx.account, store: ctx.store, pool: ctx.pool }, blobId);
+    const blob = await readBlob(blobId, { account: ctx.account, store: ctx.store, pool: ctx.pool });
     if (!blob) {
       notFound.push(blobId);
       continue;

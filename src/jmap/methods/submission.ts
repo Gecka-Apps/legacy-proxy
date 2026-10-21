@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
@@ -11,6 +12,7 @@ import { JmapError, accountNotFound, cannotCalculateChanges, invalidArguments, n
 import { applyEmailUpdate } from "./email.js";
 import { SIDE_RESPONSES, type MethodCall } from "../router.js";
 import { encodeEmailState } from "../../state/states.js";
+import { log } from "../../util/log.js";
 
 interface SetError {
   type: string;
@@ -114,6 +116,59 @@ async function fetchRfc822(
   return { raw, mailboxName: mbox.name };
 }
 
+// The Message-ID the recipients see. nodemailer's info.messageId is one it
+// makes up itself; with a raw message it never reaches the wire.
+export function messageIdOf(raw: Buffer): string | null {
+  const text = raw.toString("binary");
+  const end = text.search(/\r?\n\r?\n/);
+  const head = end < 0 ? text : text.slice(0, end);
+  const m = /^message-id:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/im.exec(head);
+  return m ? m[1]!.replace(/\s+/g, " ").trim() : null;
+}
+
+// RFC 8621 §7.5: the Bcc header must not reach the recipients. Drop it (and
+// its folded continuation lines) from the header block, leaving the body
+// byte-for-byte untouched.
+export function stripBccHeader(raw: Buffer): Buffer {
+  const text = raw.toString("binary");
+  const m = /\r?\n\r?\n/.exec(text);
+  // Include the last header line's own line break so every line we keep is
+  // terminated and the blank separator line follows untouched.
+  const headerEnd = m ? m.index + (text[m.index] === "\r" ? 2 : 1) : text.length;
+  const lines = text.slice(0, headerEnd).split(/(?<=\n)/);
+  const kept: string[] = [];
+  let dropping = false;
+  for (const line of lines) {
+    if (/^[ \t]/.test(line)) {
+      if (!dropping) kept.push(line);
+      continue;
+    }
+    dropping = /^bcc[ \t]*:/i.test(line);
+    if (!dropping) kept.push(line);
+  }
+  return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
+}
+
+// Gmail keeps one message per Message-ID, and the copy its SMTP server files in
+// Sent shares the draft's id, so it lands on the draft instead: one message
+// that stays in Drafts, which Gmail will not let an IMAP client move out (#25).
+// Sending under a fresh id, as Thunderbird does, gives Gmail a message of its
+// own to file in Sent, and the draft can then simply be deleted.
+export function withFreshMessageId(raw: Buffer): Buffer {
+  const text = raw.toString("binary");
+  const m = /\r?\n\r?\n/.exec(text);
+  const headerEnd = m ? m.index : text.length;
+  const head = text.slice(0, headerEnd);
+  const old = /^message-id:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/im.exec(head);
+  if (!old) return raw;
+  const domain = /@([^>\s]+)>?\s*$/.exec(old[1]!)?.[1] ?? "localhost";
+  const replaced = `Message-ID: <${randomUUID()}@${domain}>`;
+  return Buffer.from(
+    head.slice(0, old.index) + replaced + head.slice(old.index + old[0].length) + text.slice(headerEnd),
+    "binary",
+  );
+}
+
 function asEmail(s: string | undefined | null): string | null {
   if (!s) return null;
   const t = s.trim();
@@ -173,6 +228,7 @@ export async function emailSubmissionSet(
   const creds = await openCredentials(ctx.cfg.vaultKey, ctx.account.vault);
 
   const oldState = stateString(ctx.store.getState(ctx.account.id, "submission"));
+  const gmail = ctx.account.kind === "gmail";
 
   const created: Record<string, SubmissionResult> = {};
   const notCreated: Record<string, SetError> = {};
@@ -185,13 +241,29 @@ export async function emailSubmissionSet(
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
-      await submit({
+      const outgoing = gmail ? withFreshMessageId(stripBccHeader(raw)) : stripBccHeader(raw);
+      const result = await submit({
         provider,
         creds,
         envelopeFrom: env.from,
         rcptTo: env.to,
-        raw,
+        raw: outgoing,
       });
+      // The only record a send leaves on our side. Without it there is no way
+      // to tell "never left the proxy" from "delivered, nobody answered".
+      // Addresses are personal data, so they are only logged on request.
+      const sendLog = {
+        emailId: payload.emailId,
+        accepted: result.accepted.length,
+        rejected: result.rejected.length,
+        smtpResponse: result.response,
+        messageId: messageIdOf(outgoing),
+        ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
+          ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
+          : {}),
+      };
+      if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
+      else log.info(sendLog, "submission: accepted by SMTP server");
       const id = `s-${ctx.account.id}-${Date.now()}-${tempId}`;
       const sub: SubmissionResult = {
         id,
@@ -212,6 +284,18 @@ export async function emailSubmissionSet(
       rememberSubmission(ctx.account.id, sub);
       successByTempId.set(tempId, { emailId: payload.emailId });
     } catch (e) {
+      const smtp = e as { response?: string; responseCode?: number; command?: string; code?: string };
+      log.warn(
+        {
+          emailId: payload.emailId,
+          err: (e as Error).message,
+          smtpResponse: smtp.response,
+          smtpResponseCode: smtp.responseCode,
+          smtpCommand: smtp.command,
+          code: smtp.code,
+        },
+        "submission failed",
+      );
       notCreated[tempId] = toSetError(e);
     }
   }
@@ -253,6 +337,17 @@ export async function emailSubmissionSet(
     const ok = successByTempId.get(key);
     if (!ok) continue;
     if (skipDestroy.has(ok.emailId)) continue;
+    // Gmail's SMTP server has already filed the sent copy in Sent (see
+    // withFreshMessageId), so the draft goes instead of being filed again.
+    if (gmail) {
+      try {
+        await applyEmailUpdate(ok.emailId, { mailboxIds: {} }, ctx);
+        implicitDestroyed.push(ok.emailId);
+      } catch (e) {
+        implicitNotDestroyed[ok.emailId] = toSetErrorLike(e);
+      }
+      continue;
+    }
     try {
       await applyEmailUpdate(ok.emailId, patch as Record<string, unknown>, ctx);
       implicitUpdated[ok.emailId] = null;
