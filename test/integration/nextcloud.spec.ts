@@ -10,8 +10,8 @@
 
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Buffer } from "node:buffer";
-import { addressBookGet, addressBookSet, contactCardGet, contactCardQuery, contactCardSet } from "../../src/jmap/methods/contacts.js";
-import { calendarEventGet, calendarEventQuery, calendarEventSet, calendarGet, calendarSet } from "../../src/jmap/methods/calendar.js";
+import { addressBookChanges, addressBookGet, addressBookSet, contactCardGet, contactCardQuery, contactCardSet } from "../../src/jmap/methods/contacts.js";
+import { calendarEventChanges, calendarEventGet, calendarEventQuery, calendarEventSet, calendarGet, calendarSet } from "../../src/jmap/methods/calendar.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import type { AccountRow, Store } from "../../src/state/store.js";
@@ -199,6 +199,12 @@ const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
         const gone = await calendarSet({ accountId: "1", destroy: [id], onDestroyRemoveEvents: true }, alice);
         expect(gone.destroyed).toEqual([id]);
       }
+      // Nextcloud keeps a deleted calendar in place as nc:deleted-calendar
+      // for its trash bin, where the user can restore it: it must not show.
+      // Only a DELETE flagged X-NC-CalDAV-No-Trashbin purges it.
+      resetCalDavCaches();
+      expect((await calendarGet({ accountId: "1", ids: null }, alice)).list.map((c) => c.id)).not.toContain(id);
+      await davAs("alice", "DELETE", hrefOf(id), undefined, { "X-NC-CalDAV-No-Trashbin": "1" });
     });
   });
 
@@ -342,6 +348,113 @@ const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
         await calendarEventSet({ accountId: "2", destroy: [res.created!.e!.id as string] }, bob);
       }
       expect(hrefOf(shared.id as string)).toContain("_shared_by_alice");
+    });
+  });
+
+  describe("what changes in Nextcloud itself", () => {
+    const contactsOf = async () => (await addressBookGet({ accountId: "1", ids: null }, alice)).list.find((b) => b.name === "Contacts")!;
+
+    it("moves the address-book state when a card is added from Nextcloud, and the card shows", async () => {
+      const book = await contactsOf();
+      const before = (await addressBookGet({ accountId: "1", ids: null }, alice)).state;
+      const href = `${hrefOf(book.id)}${RUN}-ext.vcf`;
+      const vcard = ["BEGIN:VCARD", "VERSION:3.0", `UID:${RUN}-ext`, `FN:Externe ${RUN}`, "EMAIL:ext@example.test", "END:VCARD", ""].join("\r\n");
+      expect((await davAs("alice", "PUT", href, vcard, { "Content-Type": "text/vcard; charset=utf-8" })).status).toBe(201);
+      try {
+        resetCardDavCaches();
+        const after = (await addressBookGet({ accountId: "1", ids: null }, alice)).state;
+        expect(after).not.toBe(before);
+        await expect(addressBookChanges({ accountId: "1", sinceState: before }, alice)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+        const q = await contactCardQuery({ accountId: "1", filter: { inAddressBook: book.id } }, alice);
+        const cards = (await contactCardGet({ accountId: "1", ids: q.ids }, alice)).list as Array<Record<string, any>>;
+        expect(cards.map((c) => c.uid)).toContain(`${RUN}-ext`);
+      } finally {
+        await davAs("alice", "DELETE", href);
+      }
+    });
+
+    it("moves the event state when an event is added from Nextcloud", async () => {
+      const cal = (await calendarGet({ accountId: "1", ids: null }, alice)).list.find((c) => c.isDefault)!;
+      const before = (await calendarEventGet({ accountId: "1", ids: [] }, alice)).state;
+      const href = `${hrefOf(cal.id as string)}${RUN}-ext.ics`;
+      const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//test//EN", "BEGIN:VEVENT", `UID:${RUN}-ext`, "DTSTAMP:20310101T000000Z",
+        "DTSTART:20310610T000000Z", "DTEND:20310610T010000Z", `SUMMARY:Externe ${RUN}`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n");
+      expect((await davAs("alice", "PUT", href, ics, { "Content-Type": "text/calendar; charset=utf-8" })).status).toBe(201);
+      try {
+        resetCalDavCaches();
+        const after = (await calendarEventGet({ accountId: "1", ids: [] }, alice)).state;
+        expect(after).not.toBe(before);
+        await expect(calendarEventChanges({ accountId: "1", sinceState: before }, alice)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+      } finally {
+        await davAs("alice", "DELETE", href);
+      }
+    });
+  });
+
+  describe("contact groups and paging", () => {
+    it("round-trips a group card and its members", async () => {
+      const book = (await addressBookGet({ accountId: "1", ids: null }, alice)).list.find((b) => b.name === "Contacts")!;
+      const member = (n: string) => ({ "@type": "Card", uid: `urn:uuid:${RUN}-${n}`, addressBookIds: { [book.id]: true }, name: { full: `${n} ${RUN}` } });
+      const res = await contactCardSet(
+        {
+          accountId: "1",
+          create: {
+            a: member("Ana"),
+            b: member("Ben"),
+            g: { "@type": "Card", kind: "group", uid: `urn:uuid:${RUN}-group`, addressBookIds: { [book.id]: true }, name: { full: `Équipe ${RUN}` },
+              members: { [`urn:uuid:${RUN}-Ana`]: true, [`urn:uuid:${RUN}-Ben`]: true } },
+          },
+        },
+        alice,
+      );
+      expect(res.notCreated).toBeNull();
+      const ids = ["a", "b", "g"].map((k) => res.created![k]!.id as string);
+      try {
+        resetCardDavCaches();
+        const group = (await contactCardGet({ accountId: "1", ids: [ids[2]!] }, alice)).list[0] as Record<string, any>;
+        expect(group).toMatchObject({ kind: "group", members: { [`urn:uuid:${RUN}-Ana`]: true, [`urn:uuid:${RUN}-Ben`]: true } });
+      } finally {
+        await contactCardSet({ accountId: "1", destroy: ids }, alice);
+      }
+    });
+
+    it("pages ContactCard/query without losing or repeating a card", async () => {
+      const all = await contactCardQuery({ accountId: "1" }, alice);
+      expect(all.total).toBeGreaterThan(2);
+      const pages: string[] = [];
+      for (let position = 0; position < all.total; position += 2) {
+        const page = await contactCardQuery({ accountId: "1", position, limit: 2 }, alice);
+        expect(page.total).toBe(all.total);
+        pages.push(...page.ids);
+      }
+      expect(pages).toEqual(all.ids);
+    });
+  });
+
+  describe("the birthday calendar", () => {
+    it("is read-only and never the default once Nextcloud fills it from a birthday", async () => {
+      const book = (await addressBookGet({ accountId: "1", ids: null }, alice)).list.find((b) => b.name === "Contacts")!;
+      const res = await contactCardSet(
+        { accountId: "1", create: { c: { "@type": "Card", uid: `urn:uuid:${RUN}-bday`, addressBookIds: { [book.id]: true }, name: { full: `Anniv ${RUN}` },
+          anniversaries: { b: { kind: "birth", date: { "@type": "PartialDate", year: 1980, month: 7, day: 14 } } } } } },
+        alice,
+      );
+      expect(res.notCreated).toBeNull();
+      try {
+        resetCalDavCaches();
+        const cals = (await calendarGet({ accountId: "1", ids: null }, alice)).list;
+        const birthdays = cals.find((c) => hrefOf(c.id as string).endsWith("/contact_birthdays/"));
+        expect(birthdays, "Nextcloud did not create contact_birthdays").toBeDefined();
+        expect(birthdays).toMatchObject({ isDefault: false, myRights: { mayReadItems: true, mayWriteAll: false, mayShare: false } });
+        const found = await calendarEventQuery(
+          { accountId: "1", filter: { inCalendar: birthdays!.id as string, after: "2031-07-13T00:00:00", before: "2031-07-16T00:00:00" }, timeZone: "Pacific/Noumea" },
+          alice,
+        );
+        const events = (await calendarEventGet({ accountId: "1", ids: found.ids }, alice)).list;
+        expect(events.map((e) => String(e.title))).toEqual(expect.arrayContaining([expect.stringContaining(`Anniv ${RUN}`)]));
+      } finally {
+        await contactCardSet({ accountId: "1", destroy: [res.created!.c!.id as string] }, alice);
+      }
     });
   });
 });
