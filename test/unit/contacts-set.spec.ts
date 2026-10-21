@@ -27,6 +27,8 @@ interface Book {
   displayName: string;
   description: string | null;
   resources: Map<string, Resource>;
+  /** Reported as current-user-privilege-set when set. */
+  privileges?: string[];
 }
 
 const HOME = "/books/u/";
@@ -92,6 +94,7 @@ class FakeDav {
       <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
       <D:displayname>${esc(b.displayName)}</D:displayname>
       ${b.description ? `<C:addressbook-description>${esc(b.description)}</C:addressbook-description>` : ""}
+      ${b.privileges ? `<D:current-user-privilege-set>${b.privileges.map((p) => `<D:privilege><D:${p}/></D:privilege>`).join("")}</D:current-user-privilege-set>` : ""}
       <CS:getctag>"${esc(ctag)}"</CS:getctag>
     </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
   }
@@ -751,6 +754,35 @@ describe("default address book", () => {
     await addressBookSet({ accountId: "7", destroy: [idOf(work)] }, ctx);
     const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
     expect(books.list.map((b) => [b.name, b.isDefault])).toEqual([["Contacts", true]]);
+  });
+
+  it("never lands on a book the user cannot write into, stored choice included", async () => {
+    const system = dav.addBook("z-server-generated--system", "Carnet d'adresses du système");
+    dav.books.get(system)!.privileges = ["read"];
+    const contacts = dav.addBook("contacts", "Contacts");
+    dav.books.get(contacts)!.privileges = ["read", "write", "write-content"];
+    ctx.store.setPref(ctx.account.id, "addressbook:default", idOf(system));
+
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.map((b) => [b.name, b.isDefault, b.myRights.mayWrite])).toEqual([
+      ["Carnet d'adresses du système", false, false],
+      ["Contacts", true, true],
+    ]);
+
+    const card = await contactCardSet({ accountId: "7", create: { c: { name: { full: "Bob" } } } }, ctx);
+    expect(card.notCreated).toBeNull();
+    expect(dav.books.get(contacts)!.resources.size).toBe(1);
+    expect(dav.books.get(system)!.resources.size).toBe(0);
+  });
+
+  it("ignores onSuccessSetIsDefault towards a read-only book", async () => {
+    dav.addBook("contacts", "Contacts");
+    const shared = dav.addBook("equipe_shared_by_laurent", "Équipe");
+    dav.books.get(shared)!.privileges = ["read"];
+    const res = await addressBookSet({ accountId: "7", onSuccessSetIsDefault: idOf(shared) }, ctx);
+    expect(res.updated).toBeNull();
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.find((b) => b.isDefault)?.name).toBe("Contacts");
   });
 });
 

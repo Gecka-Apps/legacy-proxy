@@ -30,6 +30,8 @@ export interface AddressBookInfo {
   description: string | null;
   /** ctag or sync-token, when offered. Used to derive a JMAP state string. */
   ctag: string | null;
+  /** The current user's privileges on the book, null when not reported. */
+  privileges: string[] | null;
 }
 
 export interface VCardResource {
@@ -202,6 +204,7 @@ export class CardDavClient {
       "urn:ietf:params:xml:ns:carddav addressbook-description",
       "http://calendarserver.org/ns/ getctag",
       "DAV:sync-token",
+      "DAV:current-user-privilege-set",
     ]);
 
     const responses = splitResponses(xml);
@@ -215,6 +218,7 @@ export class CardDavClient {
         displayName: textOf(r, "displayname") ?? leafName(href),
         description: textOf(r, "addressbook-description"),
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
+        privileges: currentUserPrivileges(r),
       });
     }
     bookListCache.set(this.cacheKey, { books, at: Date.now() });
@@ -599,6 +603,30 @@ export function hasResourceType(chunk: string, localName: string): boolean {
   // Some servers return resourcetype as a self-closing wrapper; fall back to a
   // raw scan of the chunk.
   return new RegExp(`<(?:[A-Za-z][\\w-]*:)?resourcetype\\b[^>]*>[\\s\\S]*?<(?:[A-Za-z][\\w-]*:)?${localName}\\b`, "i").test(chunk);
+}
+
+/**
+ * The current user's privileges on a collection (RFC 3744 §5.4), as local
+ * names: "read", "write-content", "all"… Null when the server did not report
+ * the property, or reported it empty in a 404 propstat.
+ */
+export function currentUserPrivileges(chunk: string): string[] | null {
+  const block = textOf(chunk, "current-user-privilege-set");
+  if (!block) return null;
+  const names = [...block.matchAll(/<(?:[A-Za-z][\w-]*:)?privilege\b[^>]*>\s*<(?:[A-Za-z][\w-]*:)?([\w-]+)/g)].map((m) =>
+    m[1]!.toLowerCase(),
+  );
+  return names.length > 0 ? names : null;
+}
+
+/**
+ * Whether resources can be written into a collection. `write-content` is the
+ * one that matters: Radicale reports it without `bind`, and a read-only
+ * Nextcloud collection (birthdays, a read-only share) may still carry
+ * `write-properties`. Unknown privileges withhold nothing.
+ */
+export function canWriteContent(privileges: string[] | null): boolean {
+  return privileges === null || privileges.some((p) => p === "all" || p === "write" || p === "write-content");
 }
 
 /** Pick the first href inside the named element, e.g. <addressbook-home-set><href>…</href></addressbook-home-set>. */

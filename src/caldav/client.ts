@@ -11,6 +11,7 @@ import { log } from "../util/log.js";
 import {
   absolutise,
   buildAuth,
+  currentUserPrivileges,
   escapeXml,
   extractHref,
   hasResourceType,
@@ -41,6 +42,8 @@ export interface CalendarInfo {
   components: string[];
   /** ctag or sync-token, when offered. Used to derive a JMAP state string. */
   ctag: string | null;
+  /** The current user's privileges on the calendar, null when not reported. */
+  privileges: string[] | null;
 }
 
 export interface CalendarResource {
@@ -167,6 +170,7 @@ export class CalDavClient {
       `${NS.A} calendar-color`,
       `${NS.CS} getctag`,
       "DAV:sync-token",
+      "DAV:current-user-privilege-set",
     ]);
 
     const calendars: CalendarInfo[] = [];
@@ -184,6 +188,7 @@ export class CalDavClient {
         color: rawColor ? normaliseColor(rawColor) : null,
         components,
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
+        privileges: currentUserPrivileges(r),
       });
     }
     calendarListCache.set(this.cacheKey, { items: calendars, at: Date.now() });

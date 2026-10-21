@@ -39,6 +39,8 @@ interface Cal {
   color: string | null;
   components: string[];
   resources: Map<string, Resource>;
+  /** Reported as current-user-privilege-set when set. */
+  privileges?: string[];
 }
 
 const HOME = "/cals/u/";
@@ -95,6 +97,7 @@ class FakeDav {
       ${c.description ? `<C:calendar-description>${esc(c.description)}</C:calendar-description>` : ""}
       ${c.color ? `<A:calendar-color>${esc(c.color)}</A:calendar-color>` : ""}
       <C:supported-calendar-component-set>${c.components.map((x) => `<C:comp name="${x}"/>`).join("")}</C:supported-calendar-component-set>
+      ${c.privileges ? `<D:current-user-privilege-set>${c.privileges.map((p) => `<D:privilege><D:${p}/></D:privilege>`).join("")}</D:current-user-privilege-set>` : ""}
       <CS:getctag>"${esc(ctag)}"</CS:getctag>
     </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
   }
@@ -382,6 +385,41 @@ describe("default calendar", () => {
     await calendarSet({ accountId: "7", onSuccessSetIsDefault: calendarId(work) }, ctx);
     await calendarSet({ accountId: "7", destroy: [calendarId(work)] }, ctx);
     expect((await calendarGet({ accountId: "7", ids: null }, ctx)).list.map((c) => [c.name, c.isDefault])).toEqual([["Personnel", true]]);
+  });
+
+  it("never lands on a calendar the user cannot write into, stored choice included", async () => {
+    const birthdays = dav.addCalendar("contact_birthdays", "Anniversaires");
+    dav.cals.get(birthdays)!.privileges = ["read", "write-properties"];
+    const personal = dav.addCalendar("personal", "Personnel");
+    dav.cals.get(personal)!.privileges = ["read", "write", "write-content"];
+    ctx.store.setPref(ctx.account.id, "calendar:default", calendarId(birthdays));
+
+    const r = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(r.list.map((c) => [c.name, c.isDefault, (c.myRights as { mayWriteAll: boolean }).mayWriteAll])).toEqual([
+      ["Anniversaires", false, false],
+      ["Personnel", true, true],
+    ]);
+
+    const e = await calendarEventSet({ accountId: "7", create: { e: EVENT } }, ctx);
+    expect(e.notCreated).toBeNull();
+    expect(dav.cals.get(personal)!.resources.size).toBe(1);
+    expect(dav.cals.get(birthdays)!.resources.size).toBe(0);
+  });
+
+  it("ignores onSuccessSetIsDefault towards a read-only calendar", async () => {
+    dav.addCalendar("calendar", "Personnel");
+    const shared = dav.addCalendar("famille_shared_by_laurent", "Famille");
+    dav.cals.get(shared)!.privileges = ["read"];
+    const r = await calendarSet({ accountId: "7", onSuccessSetIsDefault: calendarId(shared) }, ctx);
+    expect(r.updated).toBeNull();
+    expect((await calendarGet({ accountId: "7", ids: null }, ctx)).list.find((c) => c.isDefault)?.name).toBe("Personnel");
+  });
+
+  it("keeps a read-only calendar as default when there is nothing else", async () => {
+    const only = dav.addCalendar("contact_birthdays", "Anniversaires");
+    dav.cals.get(only)!.privileges = ["read"];
+    const r = await calendarGet({ accountId: "7", ids: null }, ctx);
+    expect(r.list.map((c) => [c.name, c.isDefault])).toEqual([["Anniversaires", true]]);
   });
 });
 

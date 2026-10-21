@@ -21,6 +21,7 @@ import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { CalDavClient, CalDavConflict, type CalendarInfo } from "../../caldav/client.js";
+import { canWriteContent } from "../../carddav/client.js";
 import { parseICalendar, serializeEvent, utcBounds, type JsEvent, type JsonObject } from "../../caldav/jscalendar.js";
 import { isValidTimeZone, localToUtc, parseLocal, toIcalUtc } from "../../caldav/tz.js";
 import type { Credentials } from "../../auth/credentials.js";
@@ -152,16 +153,20 @@ const PREF_CALENDAR = (id: string) => `calendar:${id}`;
 const PREF_DEFAULT_CALENDAR = "calendar:default";
 const PREF_DEFAULT_IDENTITY = "participant-identity:default";
 
-const RIGHTS = {
-  mayReadFreeBusy: true,
-  mayReadItems: true,
-  mayWriteAll: true,
-  mayWriteOwn: true,
-  mayUpdatePrivate: true,
-  mayRSVP: true,
-  mayShare: false,
-  mayDelete: true,
-};
+/** JMAP rights from the privileges the CalDAV server reports for the user. */
+function rightsOf(c: CalendarInfo): JsonObject {
+  const write = canWriteContent(c.privileges);
+  return {
+    mayReadFreeBusy: true,
+    mayReadItems: true,
+    mayWriteAll: write,
+    mayWriteOwn: write,
+    mayUpdatePrivate: write,
+    mayRSVP: write,
+    mayShare: false,
+    mayDelete: write,
+  };
+}
 
 function projectCalendar(ctx: CalendarCtx, c: CalendarInfo, isDefault: boolean): JsonObject {
   const id = calendarId(c.href);
@@ -180,7 +185,7 @@ function projectCalendar(ctx: CalendarCtx, c: CalendarInfo, isDefault: boolean):
     defaultAlertsWithoutTime: prefs.defaultAlertsWithoutTime ?? null,
     timeZone: prefs.timeZone ?? null,
     shareWith: null,
-    myRights: RIGHTS,
+    myRights: rightsOf(c),
   };
 }
 
@@ -191,18 +196,22 @@ function eventCalendars(cals: CalendarInfo[]): CalendarInfo[] {
 
 /**
  * The calendar flagged isDefault and used when an event is created without a
- * calendarIds. The account's stored choice wins as long as that calendar still
- * exists; otherwise the collection the server sets up for a new account (per DAV flavor),
- * otherwise the first by href. The server lists collections in directory
- * order, so nothing here relies on the order of the PROPFIND response.
+ * calendarIds. Only calendars the user can write into are candidates, unless
+ * there are none. Among them, the account's stored choice wins as long as that
+ * calendar still exists; otherwise the collection the server sets up for a new
+ * account (per DAV flavor), otherwise the first by href. The server lists
+ * collections in directory order, so nothing here relies on the order of the
+ * PROPFIND response.
  */
 function defaultCalendar(ctx: CalendarCtx, cals: CalendarInfo[]): CalendarInfo | undefined {
-  if (cals.length === 0) return undefined;
+  const writable = cals.filter((c) => canWriteContent(c.privileges));
+  const pool = writable.length > 0 ? writable : cals;
+  if (pool.length === 0) return undefined;
   const pref = ctx.store.getPref<string>(ctx.account.id, PREF_DEFAULT_CALENDAR);
-  const chosen = pref ? cals.find((c) => calendarId(c.href) === pref) : undefined;
+  const chosen = pref ? pool.find((c) => calendarId(c.href) === pref) : undefined;
   if (chosen) return chosen;
   const slug = DEFAULT_COLLECTION[davFlavor(ctx.provider.caldav)].calendar;
-  return cals.find((c) => leaf(c.href) === slug) ?? [...cals].sort((a, b) => a.href.localeCompare(b.href))[0];
+  return pool.find((c) => leaf(c.href) === slug) ?? [...pool].sort((a, b) => a.href.localeCompare(b.href))[0];
 }
 
 export async function calendarGet(
@@ -257,7 +266,7 @@ export async function calendarSet(
       });
       const id = calendarId(href);
       savePrefs(ctx, id, raw);
-      const info: CalendarInfo = { href, displayName: name, description: null, color: null, components: ["VEVENT"], ctag: null };
+      const info: CalendarInfo = { href, displayName: name, description: null, color: null, components: ["VEVENT"], ctag: null, privileges: null };
       cals = [...cals, info];
       const projected = projectCalendar(ctx, info, defaultCalendar(ctx, eventCalendars(cals)) === info);
       const { name: _n, ...serverSet } = projected;
@@ -338,8 +347,9 @@ export async function calendarSet(
 
   // draft-ietf-jmap-calendars §4.3: applied only when every create, update
   // and destroy went through; an id that matches nothing is ignored, not an
-  // error. A `#tempId` names a calendar created above. The calendars whose
-  // isDefault flips are reported back with the server-set value.
+  // error, and so is a calendar the user cannot write into. A `#tempId` names
+  // a calendar created above. The calendars whose isDefault flips are
+  // reported back with the server-set value.
   if (args.onSuccessSetIsDefault != null && !out.notCreated && !out.notUpdated && !out.notDestroyed) {
     let wanted = args.onSuccessSetIsDefault;
     let createdAs: string | null = null;
@@ -347,7 +357,7 @@ export async function calendarSet(
       createdAs = wanted.slice(1);
       wanted = (out.created?.[createdAs]?.id as string | undefined) ?? "";
     }
-    const target = eventCalendars(cals).find((c) => calendarId(c.href) === wanted);
+    const target = eventCalendars(cals).find((c) => calendarId(c.href) === wanted && canWriteContent(c.privileges));
     if (target) {
       ctx.store.setPref(ctx.account.id, PREF_DEFAULT_CALENDAR, wanted);
       const created = createdAs ? out.created?.[createdAs] : undefined;
