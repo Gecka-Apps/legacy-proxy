@@ -18,8 +18,19 @@ interface Subscriber {
   ping: NodeJS.Timeout;
 }
 
+export interface StreamHooks {
+  opened(accountId: number): void;
+  closed(accountId: number): void;
+}
+
 export class EventSourceHub {
   private clients = new Map<number, Set<Subscriber>>();
+  private hooks: StreamHooks | null = null;
+
+  /** Told about every stream that opens or closes, per account. */
+  setHooks(hooks: StreamHooks): void {
+    this.hooks = hooks;
+  }
 
   add(
     account: AccountRow,
@@ -58,12 +69,14 @@ export class EventSourceHub {
       ping,
     };
     set.add(sub);
+    this.hooks?.opened(account.id);
 
     reply.raw.on("close", () => {
       clearInterval(sub.ping);
       const accountSet = this.clients.get(account.id);
       accountSet?.delete(sub);
       if (accountSet && accountSet.size === 0) this.clients.delete(account.id);
+      this.hooks?.closed(account.id);
     });
   }
 

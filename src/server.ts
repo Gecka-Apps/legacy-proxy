@@ -43,9 +43,10 @@ const idleManager = new PushIdleManager(cfg, store);
 store.setStateListener((accountId, kind, state) => dispatcher.onBump(accountId, kind, state));
 
 // The dispatcher tells the idle manager when the verified-subscription set
-// changed so it can spin up or tear down INBOX IDLE workers without needing
-// to sweep the DB on every JMAP call.
+// changed, the hub when an EventSource stream opens or closes, so it can spin
+// up or tear down INBOX IDLE workers without sweeping the DB on every call.
 dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
+hub.setHooks({ opened: idleManager.streamOpened, closed: idleManager.streamClosed });
 
 // Spin up idle workers for any verified subscription that survived a previous
 // run. Failure here is non-fatal (the next reconnect will try again), so we

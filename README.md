@@ -107,7 +107,8 @@ Transport:
   POST, after DNS resolution and on a connection pinned to the checked
   addresses. Redirects are not followed.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
-  least one verified push subscription, watching INBOX. New arrivals bump
+  least one verified push subscription or an open EventSource stream, and for
+  two minutes after its last stream closes, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
   `Email`; expunges bump `Email` and `Mailbox`.
 

@@ -1,7 +1,9 @@
 // Holds one dedicated IMAP connection per account that has at least one
-// verified PushSubscription. The connection sits in INBOX with IDLE running,
-// so EXISTS/EXPUNGE/FETCH-FLAGS untaggeds wake us as soon as the server emits
-// them — no client polling, no cron, no second JMAP request. New arrivals
+// verified PushSubscription or an open EventSource stream: the mail lands in
+// the IMAP server, so without IDLE the proxy never learns of a delivery and
+// an open webmail tab is never told. The connection sits in INBOX with IDLE
+// running, so EXISTS/EXPUNGE/FETCH-FLAGS untaggeds wake us as soon as the
+// server emits them — no client polling, no cron, no second JMAP request. New arrivals
 // bump `email_delivery` (the type the webmail subscribes to for system
 // notifications); structural changes also bump `email` and `mailbox` so SSE
 // clients refresh.
@@ -31,6 +33,11 @@ const RECONNECT_MAX_MS = 60_000;
 // IDLE before that to keep the channel alive.
 const IDLE_REFRESH_MS = 25 * 60_000;
 
+// An EventSource stream drops and comes back on every page load and network
+// blip; the worker outlives the account's last stream by this long so those
+// cost no fresh login.
+const STREAM_GRACE_MS = 2 * 60_000;
+
 // imapflow's IDLE helper is fire-and-await: it returns when IDLE ends. We
 // kick it off in the background and rotate before the server times us out.
 interface Worker {
@@ -43,6 +50,8 @@ interface Worker {
 
 export class PushIdleManager {
   private workers = new Map<number, Worker>();
+  private streams = new Map<number, number>();
+  private graceTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(
     private cfg: AppConfig,
@@ -52,7 +61,11 @@ export class PushIdleManager {
   // Compute the desired set from the DB and converge `workers` onto it.
   // Idempotent — safe to call any time the subscription set changes.
   async sync(): Promise<void> {
-    const desired = new Set(this.store.accountsWithActivePushSubs());
+    const desired = new Set([
+      ...this.store.accountsWithActivePushSubs(),
+      ...this.streams.keys(),
+      ...this.graceTimers.keys(),
+    ]);
 
     // Drop workers for accounts that no longer need one.
     for (const [accountId, worker] of this.workers) {
@@ -75,7 +88,35 @@ export class PushIdleManager {
     void this.sync();
   };
 
+  streamOpened = (accountId: number): void => {
+    this.streams.set(accountId, (this.streams.get(accountId) ?? 0) + 1);
+    const grace = this.graceTimers.get(accountId);
+    if (grace) {
+      clearTimeout(grace);
+      this.graceTimers.delete(accountId);
+    }
+    void this.sync();
+  };
+
+  streamClosed = (accountId: number): void => {
+    const left = (this.streams.get(accountId) ?? 1) - 1;
+    if (left > 0) {
+      this.streams.set(accountId, left);
+      return;
+    }
+    this.streams.delete(accountId);
+    const timer = setTimeout(() => {
+      this.graceTimers.delete(accountId);
+      void this.sync();
+    }, STREAM_GRACE_MS);
+    timer.unref();
+    this.graceTimers.set(accountId, timer);
+  };
+
   async closeAll(): Promise<void> {
+    for (const timer of this.graceTimers.values()) clearTimeout(timer);
+    this.graceTimers.clear();
+    this.streams.clear();
     for (const [accountId, worker] of this.workers) {
       await this.stop(accountId, worker);
     }
