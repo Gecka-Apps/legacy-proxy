@@ -1,10 +1,10 @@
-// Push relay URLs come from clients, so every POST to one goes to a public
-// address only: the URL is checked when a subscription is created, and each
+// Push relay URLs come from clients, so every POST to one goes over https
+// (RFC 8620 §7.2) to a public address only: the URL is checked when a
+// subscription is created, and each
 // delivery resolves the host, refuses it if any address is not public, and
 // connects to exactly the addresses it checked. Redirects are not followed.
 
 import dns, { type LookupAddress, type LookupOptions } from "node:dns";
-import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 
@@ -51,7 +51,7 @@ export function isPublicAddress(address: string): boolean {
 }
 
 /** Why `raw` cannot be a push target, or null when it can. */
-export function pushUrlProblem(raw: string, opts: { httpsOnly?: boolean } = {}): string | null {
+export function pushUrlProblem(raw: string): string | null {
   if (raw.length > MAX_PUSH_URL) return `url longer than ${MAX_PUSH_URL} characters`;
   let url: URL;
   try {
@@ -59,9 +59,7 @@ export function pushUrlProblem(raw: string, opts: { httpsOnly?: boolean } = {}):
   } catch {
     return "url is not a URL";
   }
-  if (url.protocol !== "https:" && (opts.httpsOnly || url.protocol !== "http:")) {
-    return opts.httpsOnly ? "url must be an https URL" : "url must be an http(s) URL";
-  }
+  if (url.protocol !== "https:") return "url must be an https URL";
   if (url.username || url.password) return "url must not carry credentials";
   const host = bareHost(url);
   if (!host) return "url has no host";
@@ -107,14 +105,13 @@ export function publicOnlyLookup(resolve: Resolve = dns.lookup as unknown as Res
  */
 export function postPush(
   raw: string,
-  opts: { headers: Record<string, string>; body: string; timeoutMs: number; httpsOnly?: boolean },
+  opts: { headers: Record<string, string>; body: string; timeoutMs: number },
 ): Promise<{ status: number }> {
-  const problem = pushUrlProblem(raw, { httpsOnly: opts.httpsOnly });
+  const problem = pushUrlProblem(raw);
   if (problem) return Promise.reject(Object.assign(new Error(problem), { code: "EPUSHTARGET" }));
   const url = new URL(raw);
-  const send = url.protocol === "https:" ? https.request : http.request;
   return new Promise((resolve, reject) => {
-    const req = send(
+    const req = https.request(
       url,
       {
         method: "POST",

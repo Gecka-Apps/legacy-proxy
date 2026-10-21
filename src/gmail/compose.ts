@@ -335,7 +335,7 @@ export class GmailCompose {
       if (total > MAX_RAW) fail("tooLarge", "Message exceeds the compose limit");
     };
     await visit(create.bodyStructure!, 0);
-    const raw = await buildRfc822(create, this.c.email.split("@")[1]!, (id) => blobs.get(id) ?? null, true);
+    const raw = await buildRfc822(create, this.c.email.split("@")[1]!, (id) => blobs.get(id) ?? null);
     if (raw.length > MAX_RAW)
       fail(
         "tooLarge",

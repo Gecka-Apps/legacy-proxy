@@ -17,6 +17,7 @@ import { keywordToFlag } from "../../mapping/flags.js";
 import { unescapePointerToken } from "../refs.js";
 import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import { readBlob } from "../blobs.js";
+import { MAX_SIZE_ATTACHMENTS_PER_EMAIL } from "../capabilities.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -1476,9 +1477,15 @@ async function applyEmailCreate(
   // uploads these can be parts of existing mail: a re-opened draft or a
   // forward references its attachments by their part blobIds.
   const blobs = new Map<string, { body: Buffer; ctype: string }>();
+  let total = 0;
   for (const blobId of referencedBlobIds(payload as JmapEmailCreate)) {
     const blob = await readBlob(blobId, ctx, MAX_ATTACHMENT_BLOB);
-    if (blob) blobs.set(blobId, blob);
+    if (!blob) continue;
+    total += blob.body.length;
+    if (total > MAX_SIZE_ATTACHMENTS_PER_EMAIL) {
+      throw new JmapError("tooLarge", `attachments exceed ${MAX_SIZE_ATTACHMENTS_PER_EMAIL} octets`);
+    }
+    blobs.set(blobId, blob);
   }
 
   let mime: Buffer;

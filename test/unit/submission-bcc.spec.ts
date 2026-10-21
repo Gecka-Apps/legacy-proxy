@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildRfc822 } from "../../src/mapping/buildMime.js";
-import { messageIdOf, stripBccHeader, withFreshMessageId } from "../../src/jmap/methods/submission.js";
+import { forLog, messageIdOf, stripBccHeader, withFreshMessageId } from "../../src/jmap/methods/submission.js";
 
 describe("Bcc handling", () => {
   it("keeps Bcc in the stored draft so the envelope can be derived from it", async () => {
@@ -64,5 +64,20 @@ describe("withFreshMessageId", () => {
   it("leaves a message without Message-ID unchanged", () => {
     const raw = Buffer.from("From: a@example.org\r\n\r\nbody");
     expect(withFreshMessageId(raw).equals(raw)).toBe(true);
+  });
+});
+
+describe("forLog", () => {
+  it("masks the addresses SMTP errors quote unless LOG_SUBMISSION_ADDRESSES=1", () => {
+    const err = 'Invalid recipient "bob@example.org"; 550 5.1.1 <carol@example.org>: unknown user [alice@example.org]';
+    expect(forLog(err)).toBe('Invalid recipient "<address>"; 550 5.1.1 <<address>>: unknown user [<address>]');
+    expect(forLog("250 OK id=1vXyZ-000Abc-Def")).toBe("250 OK id=1vXyZ-000Abc-Def");
+    expect(forLog(undefined)).toBeUndefined();
+    process.env.LOG_SUBMISSION_ADDRESSES = "1";
+    try {
+      expect(forLog(err)).toBe(err);
+    } finally {
+      delete process.env.LOG_SUBMISSION_ADDRESSES;
+    }
   });
 });

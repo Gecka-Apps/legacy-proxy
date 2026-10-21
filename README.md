@@ -88,7 +88,10 @@ Transport:
 - `POST /jmap`, `GET /jmap/session`, `/.well-known/jmap` redirect.
 - `GET /jmap/download/{accountId}/{blobId}/{type}/{name}` for both
   IMAP-backed message blobs and previously-uploaded blobs.
-- `POST /jmap/upload/{accountId}` with a 24h retention sweep.
+- `POST /jmap/upload/{accountId}` with a 24h retention sweep. An account holds
+  at most four times `MAX_SIZE_UPLOAD` of pending uploads; past that the oldest
+  are deleted first (RFC 8620 §6). `Email/set` create refuses with `tooLarge`
+  once the attachments it loads exceed `maxSizeAttachmentsPerEmail`.
 - `/dav/cal/{username}/…` and `/dav/card/{username}/…`: authenticated
   pass-through to the CalDAV / CardDAV home set, mirroring Stalwart's paths so
   the Bulwark webmail's own WebDAV proxy (used for `MKCALENDAR` with a
@@ -98,11 +101,11 @@ Transport:
 - `PushSubscription/set` runs a one-shot `PushVerification` POST against the
   subscriber URL; once verified, every state change is forwarded as a
   `StateChange` POST. 404 / 410 responses retire the subscription; 8
-  consecutive non-2xx responses also retire it. The URL must reach a public
-  address: loopback, private, link-local and other special-purpose ranges
-  are refused at creation and again on every POST, after DNS resolution and
-  on a connection pinned to the checked addresses. Redirects are not
-  followed.
+  consecutive non-2xx responses also retire it. The URL must be https
+  (RFC 8620 §7.2) and reach a public address: loopback, private, link-local
+  and other special-purpose ranges are refused at creation and again on every
+  POST, after DNS resolution and on a connection pinned to the checked
+  addresses. Redirects are not followed.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
   least one verified push subscription, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump

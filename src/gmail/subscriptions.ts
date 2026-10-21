@@ -81,7 +81,6 @@ export class GmailSubscriptions {
         headers: { "content-type": "application/json", "x-push-type": kind },
         body: JSON.stringify(body),
         timeoutMs: TIMEOUT_MS,
-        httpsOnly: true,
       });
       // A push service that has dropped the endpoint says so; stop trying at once.
       if (res.status === 404 || res.status === 410) {
@@ -198,8 +197,7 @@ export class GmailSubscriptions {
         fail("invalidProperties", "Unsupported property " + key);
     }
     const url = typeof p.url === "string" ? p.url : "";
-    // https only: a StateChange names the account and would otherwise travel in clear.
-    const problem = pushUrlProblem(url, { httpsOnly: true });
+    const problem = pushUrlProblem(url);
     if (problem) fail("invalidProperties", problem);
     const device =
       p.deviceClientId === undefined || p.deviceClientId === null

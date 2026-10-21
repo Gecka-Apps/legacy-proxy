@@ -34,28 +34,27 @@ describe("isPublicAddress", () => {
 describe("pushUrlProblem", () => {
   it("accepts a public relay", () => {
     expect(pushUrlProblem("https://notifications.relay.bulwarkmail.org/api/push/jmap/dev")).toBeNull();
-    expect(pushUrlProblem("http://relay.example/x")).toBeNull();
     expect(pushUrlProblem("https://[2606:4700::1111]/x")).toBeNull();
   });
 
   it.each([
-    "http://127.0.0.1:8080/",
-    "http://2130706433/",
-    "http://0x7f.1/",
-    "http://[::1]/",
-    "http://[::ffff:127.0.0.1]/",
-    "http://169.254.169.254/latest/meta-data/",
-    "http://172.31.10.1/",
-    "http://localhost:6379/",
-    "http://valkey.localhost./",
+    "https://127.0.0.1:8080/",
+    "https://2130706433/",
+    "https://0x7f.1/",
+    "https://[::1]/",
+    "https://[::ffff:127.0.0.1]/",
+    "https://169.254.169.254/latest/meta-data/",
+    "https://172.31.10.1/",
+    "https://localhost:6379/",
+    "https://valkey.localhost./",
   ])("refuses %s", (url) => {
     expect(pushUrlProblem(url)).toBe("url points at a non-public address");
   });
 
   it("refuses other schemes, credentials and overlong URLs", () => {
-    expect(pushUrlProblem("ftp://relay.example/")).toBe("url must be an http(s) URL");
-    expect(pushUrlProblem("file:///etc/passwd")).toBe("url must be an http(s) URL");
-    expect(pushUrlProblem("http://relay.example/", { httpsOnly: true })).toBe("url must be an https URL");
+    expect(pushUrlProblem("http://relay.example/")).toBe("url must be an https URL");
+    expect(pushUrlProblem("ftp://relay.example/")).toBe("url must be an https URL");
+    expect(pushUrlProblem("file:///etc/passwd")).toBe("url must be an https URL");
     expect(pushUrlProblem("https://u:p@relay.example/")).toBe("url must not carry credentials");
     expect(pushUrlProblem("https://relay.example/" + "y".repeat(2100))).toMatch(/longer than/);
     expect(pushUrlProblem("not a url")).toBe("url is not a URL");
@@ -100,10 +99,10 @@ describe("postPush", () => {
       cb(null, [{ address: "127.0.0.1", family: 4 }])) as never);
     try {
       await expect(
-        postPush(`http://rebound.example:${port}/x`, { headers: {}, body: "{}", timeoutMs: 2_000 }),
+        postPush(`https://rebound.example:${port}/x`, { headers: {}, body: "{}", timeoutMs: 2_000 }),
       ).rejects.toMatchObject({ code: "EPUSHTARGET" });
       await expect(
-        postPush(`http://127.0.0.1:${port}/x`, { headers: {}, body: "{}", timeoutMs: 2_000 }),
+        postPush(`https://127.0.0.1:${port}/x`, { headers: {}, body: "{}", timeoutMs: 2_000 }),
       ).rejects.toMatchObject({ code: "EPUSHTARGET" });
       expect(hits).toEqual([]);
     } finally {
@@ -111,10 +110,10 @@ describe("postPush", () => {
     }
   });
 
-  it("holds the gmail backend to https", async () => {
-    await expect(
-      postPush("http://relay.example/x", { headers: {}, body: "{}", timeoutMs: 2_000, httpsOnly: true }),
-    ).rejects.toThrow("url must be an https URL");
+  it("refuses plain http", async () => {
+    await expect(postPush("http://relay.example/x", { headers: {}, body: "{}", timeoutMs: 2_000 })).rejects.toThrow(
+      "url must be an https URL",
+    );
   });
 });
 
@@ -128,8 +127,12 @@ describe("PushSubscription/set", () => {
       bumpState: () => 1,
     } as unknown as Store;
     const ctx = { account: { id: 1 } as AccountRow, store, dispatcher: { sendVerification: vi.fn(async () => {}) } } as unknown as PushCtx;
-    const r = await pushSubscriptionSet({ create: { a: { deviceClientId: "d", url: "http://172.31.10.1:8080/", types: null } } }, ctx);
+    const r = await pushSubscriptionSet(
+      { create: { a: { deviceClientId: "d", url: "https://172.31.10.1:8080/", types: null }, b: { url: "http://relay.example/x" } } },
+      ctx,
+    );
     expect(r.notCreated?.a).toEqual({ type: "invalidProperties", properties: ["url"], description: "url points at a non-public address" });
+    expect(r.notCreated?.b).toEqual({ type: "invalidProperties", properties: ["url"], description: "url must be an https URL" });
     expect(insert).not.toHaveBeenCalled();
   });
 });

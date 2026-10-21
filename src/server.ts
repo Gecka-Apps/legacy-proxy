@@ -385,6 +385,8 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
 // Long enough that a slow client can compose a draft, short enough to bound
 // disk. 24h is the JMAP convention for "pending" uploads.
 const UPLOAD_RETENTION_MS = 24 * 60 * 60_000;
+/** Pending uploads one account may hold, a few messages' worth of attachments. */
+const UPLOAD_QUOTA_BYTES = 4 * cfg.limits.maxSizeUpload;
 
 // Fallback parser for non-JSON, non-text bodies (binary attachments, RFC822,
 // images, etc.). Fastify's built-in JSON parser still wins for /jmap; this
@@ -418,6 +420,7 @@ app.post<{ Params: { accountId: string } }>(
       return reply.code(413).send({ type: "tooLarge" });
     }
     const blobId = "U" + crypto.randomUUID().replace(/-/g, "");
+    store.makeRoomForUpload(account.id, body.length, UPLOAD_QUOTA_BYTES);
     store.putUpload({ id: blobId, accountId: account.id, ctype, body });
     // Opportunistic GC: cheap when the upload table is small, no-op when empty.
     store.pruneUploads(UPLOAD_RETENTION_MS);

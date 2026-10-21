@@ -256,7 +256,7 @@ export async function emailSubmissionSet(
         emailId: payload.emailId,
         accepted: result.accepted.length,
         rejected: result.rejected.length,
-        smtpResponse: result.response,
+        smtpResponse: forLog(result.response),
         messageId: messageIdOf(outgoing),
         ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
           ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
@@ -288,8 +288,8 @@ export async function emailSubmissionSet(
       log.warn(
         {
           emailId: payload.emailId,
-          err: (e as Error).message,
-          smtpResponse: smtp.response,
+          err: forLog((e as Error).message),
+          smtpResponse: forLog(smtp.response),
           smtpResponseCode: smtp.responseCode,
           smtpCommand: smtp.command,
           code: smtp.code,
@@ -496,4 +496,14 @@ function stateString(counter: number): string {
 function toSetError(e: unknown): SetError {
   if (e instanceof JmapError) return e.toMethodError() as SetError;
   return { type: "serverFail", description: (e as Error).message };
+}
+
+/**
+ * SMTP replies and nodemailer errors quote the addresses involved
+ * (`Invalid recipient "…"`, `550 <…> unknown user`); without
+ * LOG_SUBMISSION_ADDRESSES=1 they are masked like the rest of the send log.
+ */
+export function forLog(text: string | undefined): string | undefined {
+  if (text === undefined || process.env.LOG_SUBMISSION_ADDRESSES === "1") return text;
+  return text.replace(/[^\s<>"'(),;:[\]]+@[^\s<>"'(),;:[\]]+/g, "<address>");
 }

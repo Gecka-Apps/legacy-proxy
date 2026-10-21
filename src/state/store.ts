@@ -429,6 +429,26 @@ export class Store {
       .run(p.id, p.accountId, p.ctype, p.body.length, p.body, Date.now());
   }
 
+  /**
+   * Deletes the account's uploads, oldest first, until `incoming` more octets
+   * fit under `quota` (RFC 8620 §6: no upload is referenced once used, so
+   * every stored one is fair game).
+   */
+  makeRoomForUpload(accountId: number, incoming: number, quota: number): void {
+    const rows = this.prep(`SELECT id, size FROM upload WHERE account_id = ? ORDER BY created_at DESC, rowid DESC`)
+      .all(accountId) as { id: string; size: number }[];
+    let used = incoming;
+    let full = false;
+    const drop = this.prep(`DELETE FROM upload WHERE id = ? AND account_id = ?`);
+    for (const row of rows) {
+      if (!full && used + row.size <= quota) used += row.size;
+      else {
+        full = true;
+        drop.run(row.id, accountId);
+      }
+    }
+  }
+
   getUpload(id: string, accountId: number): { ctype: string; body: Buffer } | null {
     const row = this.prep(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as { ctype: string; body: Buffer } | undefined;
