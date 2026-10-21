@@ -406,6 +406,19 @@ describe("default calendar", () => {
     expect(dav.cals.get(birthdays)!.resources.size).toBe(0);
   });
 
+  it("refuses writes into a read-only calendar before they reach the server", async () => {
+    const shared = dav.addCalendar("shared", "Partagé", [["e.ics", MEETING]]);
+    dav.cals.get(shared)!.privileges = ["read", "write-properties"];
+    const evId = eventId(shared, `${shared}e.ics`);
+    const create = await calendarEventSet({ accountId: "7", create: { e: { ...EVENT, calendarIds: { [calendarId(shared)]: true } } } }, ctx);
+    const update = await calendarEventSet({ accountId: "7", update: { [evId]: { title: "y" } } }, ctx);
+    const destroy = await calendarEventSet({ accountId: "7", destroy: [evId] }, ctx);
+    expect(create.notCreated?.e?.type).toBe("forbidden");
+    expect(update.notUpdated?.[evId]?.type).toBe("forbidden");
+    expect(destroy.notDestroyed?.[evId]?.type).toBe("forbidden");
+    expect(dav.calls.filter((c) => c.method === "PUT" || c.method === "DELETE")).toEqual([]);
+  });
+
   it("ignores onSuccessSetIsDefault towards a read-only calendar", async () => {
     dav.addCalendar("calendar", "Personnel");
     const shared = dav.addCalendar("famille_shared_by_laurent", "Famille");
