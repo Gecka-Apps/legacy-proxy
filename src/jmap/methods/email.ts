@@ -97,6 +97,12 @@ const FETCH_SORT_PROPS = new Set(["size", "from", "to", "subject", "sentAt", "ha
 interface SearchCacheEntry {
   uids: number[];
   modseq: number;
+  /**
+   * The account's email state when the search ran. A pooled connection's
+   * highestModseq does not move when mail arrives on another one, while the
+   * IDLE worker bumps this state on every arrival, expunge and flag change.
+   */
+  emailState: number;
   expiresAt: number;
 }
 const searchCache = new Map<string, SearchCacheEntry>();
@@ -513,11 +519,12 @@ async function emailQuerySingleMailboxFull(
       (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? mboxRow.uidvalidity,
     );
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+    const emailState = ctx.store.getState(ctx.account.id, "email");
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
     let uids: number[] | null = null;
     const cached = searchCache.get(cacheKey);
-    if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+    if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
       uids = cached.uids;
     }
     if (!uids) {
@@ -526,6 +533,7 @@ async function emailQuerySingleMailboxFull(
       searchCache.set(cacheKey, {
         uids,
         modseq,
+        emailState,
         expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
       });
       pruneSearchCache();
@@ -645,11 +653,12 @@ async function emailQueryAccountWideFull(
         (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
       );
       const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+      const emailState = ctx.store.getState(ctx.account.id, "email");
 
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
       let uids: number[] | null = null;
       const cached = searchCache.get(cacheKey);
-      if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+      if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
         uids = cached.uids;
       }
       if (!uids) {
@@ -658,6 +667,7 @@ async function emailQueryAccountWideFull(
         searchCache.set(cacheKey, {
           uids,
           modseq,
+          emailState,
           expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
         });
         pruneSearchCache();
