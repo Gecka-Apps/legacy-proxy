@@ -776,6 +776,19 @@ describe("default address book", () => {
     expect(dav.books.get(system)!.resources.size).toBe(0);
   });
 
+  it("refuses writes into a read-only book before they reach the server", async () => {
+    const system = dav.addBook("z-server-generated--system", "Accounts", [["alice.vcf", ALICE]]);
+    dav.books.get(system)!.privileges = ["read"];
+    const [cardId] = (await contactCardGet({ accountId: "7", ids: null }, ctx)).list.map((c) => c.id as string);
+    const create = await contactCardSet({ accountId: "7", create: { c: { addressBookIds: { [idOf(system)]: true }, name: { full: "Bob" } } } }, ctx);
+    const update = await contactCardSet({ accountId: "7", update: { [cardId!]: { "name/full": "Al" } } }, ctx);
+    const destroy = await contactCardSet({ accountId: "7", destroy: [cardId!] }, ctx);
+    expect(create.notCreated?.c?.type).toBe("forbidden");
+    expect(update.notUpdated?.[cardId!]?.type).toBe("forbidden");
+    expect(destroy.notDestroyed?.[cardId!]?.type).toBe("forbidden");
+    expect(dav.calls.filter((c) => c.method === "PUT" || c.method === "DELETE")).toEqual([]);
+  });
+
   it("ignores onSuccessSetIsDefault towards a read-only book", async () => {
     dav.addBook("contacts", "Contacts");
     const shared = dav.addBook("equipe_shared_by_laurent", "Équipe");

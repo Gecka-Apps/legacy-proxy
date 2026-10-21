@@ -109,7 +109,7 @@ const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
         { accountId: "1", create: { c: { "@type": "Card", uid: `urn:uuid:${RUN}-ro`, addressBookIds: { [accounts.id]: true }, name: { full: "Nope" } } } },
         alice,
       );
-      expect(res.notCreated?.c).toBeDefined();
+      expect(res.notCreated?.c?.type).toBe("forbidden");
     });
 
     it("creates, renames, defaults and destroys a book; never defaults to a read-only one", async () => {
@@ -311,7 +311,7 @@ const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
         { accountId: "2", create: { e: { calendarIds: { [shared.id as string]: true }, uid: `${RUN}-ro@test`, title: "x", start: "2031-05-01T10:00:00", duration: "PT1H", timeZone: "Pacific/Noumea" } } },
         bob,
       );
-      expect(res.notCreated?.e).toBeDefined();
+      expect(res.notCreated?.e?.type).toBe("forbidden");
 
       await calendarSet({ accountId: "2", onSuccessSetIsDefault: shared.id as string }, bob);
       resetCalDavCaches();

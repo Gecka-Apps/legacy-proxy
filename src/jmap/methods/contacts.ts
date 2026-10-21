@@ -339,6 +339,16 @@ function setError(type: string, description?: string, properties?: string[]): Se
   return { type, ...(description ? { description } : {}), ...(properties ? { properties } : {}) };
 }
 
+/**
+ * Cards in a book the server reports read-only are refused here: Nextcloud
+ * answers 404 rather than 403 to a write it does not allow, which would
+ * reach the client as a server failure.
+ */
+function readOnlyBook(book: AddressBookInfo): SetError | null {
+  if (canWriteContent(book.privileges)) return null;
+  return setError("forbidden", `the address book "${book.displayName}" is read-only`);
+}
+
 function errorFor(e: unknown, fallback = "serverFail"): SetError {
   if (e instanceof CardDavConflict) {
     return setError("stateMismatch", "the resource changed on the CardDAV server; refetch and retry");
@@ -458,6 +468,11 @@ export async function contactCardSet(
         (out.notCreated ??= {})[tempId] = picked.error;
         continue;
       }
+      const createDenied = readOnlyBook(picked.book);
+      if (createDenied) {
+        (out.notCreated ??= {})[tempId] = createDenied;
+        continue;
+      }
       delete input["addressBookIds"];
       delete input["id"];
       const uid = typeof input["uid"] === "string" && input["uid"] ? (input["uid"] as string) : `urn:uuid:${crypto.randomUUID()}`;
@@ -485,6 +500,11 @@ export async function contactCardSet(
         continue;
       }
       if (!patch || typeof patch !== "object") throw new JmapError("invalidPatch", "update entry must be an object");
+      const updateDenied = readOnlyBook(book);
+      if (updateDenied) {
+        (out.notUpdated ??= {})[id] = updateDenied;
+        continue;
+      }
       const [existing] = await client.multiGet(book.href, [parts.resourceHref]);
       if (!existing) {
         (out.notUpdated ??= {})[id] = setError("notFound");
@@ -533,6 +553,11 @@ export async function contactCardSet(
       const book = parts ? books.find((b) => b.href === parts.bookHref) : undefined;
       if (!parts || !book || !client.isInBook(book.href, parts.resourceHref)) {
         (out.notDestroyed ??= {})[id] = setError("notFound");
+        continue;
+      }
+      const destroyDenied = readOnlyBook(book);
+      if (destroyDenied) {
+        (out.notDestroyed ??= {})[id] = destroyDenied;
         continue;
       }
       await client.deleteResource(parts.resourceHref);

@@ -100,6 +100,16 @@ interface SetError {
 function setError(type: string, description?: string, properties?: string[]): SetError {
   return { type, ...(description ? { description } : {}), ...(properties ? { properties } : {}) };
 }
+/**
+ * Events in a calendar the server reports read-only are refused here:
+ * Nextcloud answers 404 rather than 403 to a write it does not allow, which
+ * would reach the client as a server failure.
+ */
+function readOnlyCalendar(cal: CalendarInfo): SetError | null {
+  if (canWriteContent(cal.privileges)) return null;
+  return setError("forbidden", `the calendar "${cal.displayName}" is read-only`);
+}
+
 function errorFor(e: unknown, fallback = "serverFail"): SetError {
   if (e instanceof CalDavConflict) return setError("stateMismatch", "the resource changed on the CalDAV server; refetch and retry");
   if (e instanceof JmapError) return setError(e.type, e.message);
@@ -717,6 +727,11 @@ export async function calendarEventSet(
       stripAtType(input);
       if (cals.length === 0 && !hasExplicitCalendar(input["calendarIds"])) cals = [await ensureDefaultCalendar(client)];
       const picked = resolveCalendar(cals, defaultCalendar(ctx, cals), input["calendarIds"]);
+      const createDenied = "error" in picked ? null : readOnlyCalendar(picked.cal);
+      if (createDenied) {
+        (out.notCreated ??= {})[tempId] = createDenied;
+        continue;
+      }
       if ("error" in picked) {
         (out.notCreated ??= {})[tempId] = picked.error;
         continue;
@@ -758,6 +773,11 @@ export async function calendarEventSet(
         continue;
       }
       if (!patch || typeof patch !== "object") throw new JmapError("invalidPatch", "update entry must be an object");
+      const updateDenied = readOnlyCalendar(cal);
+      if (updateDenied) {
+        (out.notUpdated ??= {})[id] = updateDenied;
+        continue;
+      }
       const [existing] = await client.multiGet(cal.href, [parts.resourceHref]);
       const current = existing ? loadResource(cal.href, existing) : null;
       if (!existing || !current) {
@@ -803,6 +823,11 @@ export async function calendarEventSet(
       const cal = parts ? cals.find((c) => c.href === parts.calHref) : undefined;
       if (!parts || !cal) {
         (out.notDestroyed ??= {})[id] = setError("notFound");
+        continue;
+      }
+      const destroyDenied = readOnlyCalendar(cal);
+      if (destroyDenied) {
+        (out.notDestroyed ??= {})[id] = destroyDenied;
         continue;
       }
       let before: LoadedEvent | null = null;
