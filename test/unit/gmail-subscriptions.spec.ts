@@ -8,6 +8,11 @@ import { GmailMail } from "../../src/gmail/mail.js";
 import { GmailPush } from "../../src/gmail/push.js";
 import { GMAIL_MODIFY } from "../../src/gmail/config.js";
 import { JmapError } from "../../src/jmap/errors.js";
+const postPush = vi.hoisted(() => vi.fn());
+vi.mock("../../src/push/target.js", async (actual) => ({
+  ...(await actual<typeof import("../../src/push/target.js")>()),
+  postPush,
+}));
 const email = "pushed@example.test";
 const PUSH = {
   topic: "projects/p/topics/gmail",
@@ -22,17 +27,14 @@ const cleanup: (() => void)[] = [];
 let posts: { url: string; kind: string; body: any }[] = [];
 beforeEach(() => {
   posts = [];
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (url: string, init: any) => {
-      posts.push({
-        url,
-        kind: init.headers["x-push-type"],
-        body: JSON.parse(init.body),
-      });
-      return { ok: true, status: 200 };
-    }),
-  );
+  postPush.mockImplementation(async (url: string, init: any) => {
+    posts.push({
+      url,
+      kind: init.headers["x-push-type"],
+      body: JSON.parse(init.body),
+    });
+    return { status: 200 };
+  });
 });
 afterEach(() => {
   for (const f of cleanup.splice(0)) f();
@@ -276,10 +278,7 @@ it("drops an endpoint the push service has discarded and expires old subscriptio
   await call("PushSubscription/set", {
     update: { [id]: { verificationCode: code } },
   });
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => ({ ok: false, status: 410 })),
-  );
+  postPush.mockImplementation(async () => ({ status: 410 }));
   deliver("m3");
   await push.sync(email);
   expect((await call("PushSubscription/get", {})).list).toHaveLength(0);

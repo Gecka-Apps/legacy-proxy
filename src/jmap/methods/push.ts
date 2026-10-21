@@ -8,6 +8,7 @@ import type { AccountRow, PushSubscriptionRow, Store } from "../../state/store.j
 import type { PushDispatcher } from "../../push/dispatcher.js";
 import { encodeCounterState } from "../../state/states.js";
 import { log } from "../../util/log.js";
+import { pushUrlProblem } from "../../push/target.js";
 
 interface SetError {
   type: string;
@@ -279,19 +280,9 @@ interface CreateValid {
 }
 
 function validateCreate(raw: Record<string, unknown>): CreateValid | { error: SetError } {
-  const url = raw.url;
-  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
-    return {
-      error: {
-        type: "invalidProperties",
-        properties: ["url"],
-        description: "url must be an http(s) URL",
-      },
-    };
-  }
-  if (url.length > 2048) {
-    return { error: { type: "invalidProperties", properties: ["url"], description: "url too long" } };
-  }
+  const url = typeof raw.url === "string" ? raw.url : "";
+  const problem = pushUrlProblem(url);
+  if (problem) return { error: { type: "invalidProperties", properties: ["url"], description: problem } };
 
   let types: string[] | null = null;
   if (raw.types !== undefined && raw.types !== null) {

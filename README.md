@@ -98,7 +98,11 @@ Transport:
 - `PushSubscription/set` runs a one-shot `PushVerification` POST against the
   subscriber URL; once verified, every state change is forwarded as a
   `StateChange` POST. 404 / 410 responses retire the subscription; 8
-  consecutive non-2xx responses also retire it.
+  consecutive non-2xx responses also retire it. The URL must reach a public
+  address: loopback, private, link-local and other special-purpose ranges
+  are refused at creation and again on every POST, after DNS resolution and
+  on a connection pinned to the checked addresses. Redirects are not
+  followed.
 - IMAP IDLE: the proxy keeps a dedicated IMAP socket per account that has at
   least one verified push subscription, watching INBOX. New arrivals bump
   `EmailDelivery` (and `Email`, `Mailbox`); other-device flag changes bump
@@ -671,6 +675,7 @@ streams; addresses and message contents are never logged.
 With push configured the backend also accepts `PushSubscription/get` and
 `PushSubscription/set` (RFC 8620 §7.2), which is what a webmail needs for system
 notifications while every tab is closed. A subscription must use an `https` URL
+on a public address, held to the same checks as the IMAP backend's
 (typically a push relay that forwards to the browser's push service); the bridge
 POSTs a `PushVerification` to it on create and only delivers once the client
 returns that code through an update. Expiry defaults to 90 days and is capped at

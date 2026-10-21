@@ -13,6 +13,7 @@ import { encodeCounterState, encodeEmailState } from "../state/states.js";
 import type { Store, AccountRow, PushSubscriptionRow } from "../state/store.js";
 import type { EventSourceHub } from "../jmap/eventsource.js";
 import { log } from "../util/log.js";
+import { postPush } from "./target.js";
 
 // Internal store kinds → JMAP type names that share that counter.
 // `Email` and `Thread` both ride on the email counter because the IMAP
@@ -192,13 +193,10 @@ export class PushDispatcher {
     body: unknown,
     kind: "StateChange" | "PushVerification",
   ): Promise<void> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), RELAY_TIMEOUT_MS);
     let status = 0;
     let ok = false;
     try {
-      const res = await fetch(sub.url, {
-        method: "POST",
+      ({ status } = await postPush(sub.url, {
         headers: {
           "content-type": "application/json",
           // Spec-mandated header so push services / proxies can identify the
@@ -206,23 +204,14 @@ export class PushDispatcher {
           "x-push-type": kind,
         },
         body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      status = res.status;
-      ok = res.ok;
-      // Drain so keep-alive connections don't hang on to bytes.
-      try {
-        await res.arrayBuffer();
-      } catch {
-        // ignore
-      }
+        timeoutMs: RELAY_TIMEOUT_MS,
+      }));
+      ok = status >= 200 && status < 300;
     } catch (err) {
       log.warn(
         { err: (err as Error).message, url: sub.url, kind, subId: sub.id },
         "push: delivery network error",
       );
-    } finally {
-      clearTimeout(timeout);
     }
 
     if (ok) {

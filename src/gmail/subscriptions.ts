@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { JmapError } from "../jmap/errors.js";
 import type { MethodTable } from "../jmap/router.js";
+import { postPush, pushUrlProblem } from "../push/target.js";
 import type { GmailStore, PushSub } from "./store.js";
 import {
   matchesFilter,
@@ -75,22 +76,19 @@ export class GmailSubscriptions {
     body: unknown,
     kind: "StateChange" | "PushVerification" | "EmailPush",
   ): Promise<void> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch(sub.url, {
-        method: "POST",
+      const res = await postPush(sub.url, {
         headers: { "content-type": "application/json", "x-push-type": kind },
         body: JSON.stringify(body),
-        signal: controller.signal,
-        redirect: "error",
+        timeoutMs: TIMEOUT_MS,
+        httpsOnly: true,
       });
       // A push service that has dropped the endpoint says so; stop trying at once.
       if (res.status === 404 || res.status === 410) {
         this.store.unsubscribe(sub.id, sub.email);
         return;
       }
-      if (!res.ok) throw new Error("status " + res.status);
+      if (res.status < 200 || res.status >= 300) throw new Error("status " + res.status);
       this.store.subscriptionDelivered(sub.id);
     } catch (err) {
       if (this.store.subscriptionFailed(sub.id) >= MAX_FAILURES)
@@ -100,8 +98,6 @@ export class GmailSubscriptions {
         { err: err instanceof Error ? err.message : String(err), kind },
         "gmail push delivery failed",
       );
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -203,11 +199,8 @@ export class GmailSubscriptions {
     }
     const url = typeof p.url === "string" ? p.url : "";
     // https only: a StateChange names the account and would otherwise travel in clear.
-    if (!/^https:\/\//i.test(url) || url.length > 2048)
-      fail(
-        "invalidProperties",
-        "url must be an https URL of at most 2048 characters",
-      );
+    const problem = pushUrlProblem(url, { httpsOnly: true });
+    if (problem) fail("invalidProperties", problem);
     const device =
       p.deviceClientId === undefined || p.deviceClientId === null
         ? null
