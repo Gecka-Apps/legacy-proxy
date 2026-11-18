@@ -808,7 +808,9 @@ export async function calendarEventSet(
         (out.notUpdated ??= {})[id] = setError("invalidProperties", `immutable: ${bad.join(", ")}`, bad);
         continue;
       }
-      const draft = { ...current.event } as Record<string, unknown>;
+      // A deep copy: a path patch writes into nested objects, and scheduling
+      // compares the stored event with the patched one.
+      const draft = structuredClone(current.event) as Record<string, unknown>;
       applyPatch(draft, cleaned);
       draft["uid"] = current.event.uid;
       draft["sequence"] = (Number(current.event.sequence) || 0) + 1;

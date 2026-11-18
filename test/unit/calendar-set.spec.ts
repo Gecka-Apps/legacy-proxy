@@ -556,6 +556,36 @@ describe("CalendarEvent/set scheduling", () => {
     expect(sent[0]!.raw.toString("utf8")).toContain("STATUS:CANCELLED");
   });
 
+  it("mails a REPLY when the attendee's own status changes through a path patch", async () => {
+    dav.addCalendar("work", "Work");
+    const invited = {
+      ...withBob,
+      replyTo: { imip: "mailto:bob@x.io" },
+      participants: {
+        bob: { "@type": "Participant", email: "bob@x.io", roles: { owner: true, attendee: true }, participationStatus: "accepted" },
+        me: { "@type": "Participant", email: "u@x.io", roles: { attendee: true }, participationStatus: "needs-action", expectReply: true },
+      },
+    };
+    const r = await calendarEventSet({ accountId: "7", create: { n: invited }, sendSchedulingMessages: true }, ctx);
+    expect(sent).toHaveLength(0);
+    const id = r.created!.n.id as string;
+    const got = await calendarEventGet({ accountId: "7", ids: [id] }, ctx);
+    const participants = got.list[0]!.participants as Record<string, { email: string }>;
+    const mine = Object.keys(participants).find((k) => participants[k]!.email === "u@x.io")!;
+
+    const u = await calendarEventSet(
+      { accountId: "7", update: { [id]: { [`participants/${mine}/participationStatus`]: "accepted" } }, sendSchedulingMessages: true },
+      ctx,
+    );
+    expect(u.notUpdated).toBeNull();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ envelopeFrom: "u@x.io", rcptTo: ["bob@x.io"] });
+    const raw = sent[0]!.raw.toString("utf8");
+    expect(raw).toContain("Subject: Accepted: Kickoff");
+    expect(raw).toContain("METHOD:REPLY");
+    expect(raw).toContain("ATTENDEE;PARTSTAT=ACCEPTED;RSVP=TRUE:mailto:u@x.io");
+  });
+
   it("stays silent without sendSchedulingMessages", async () => {
     dav.addCalendar("work", "Work");
     await calendarEventSet({ accountId: "7", create: { n: withBob } }, ctx);
